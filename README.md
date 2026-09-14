@@ -1,7 +1,7 @@
 # Bloons Adventure Time TD — Nintendo Switch port (Unity 2020.3 / IL2CPP wrapper)
 
 This is a native wrapper / loader that runs the original ARM64 Android build of
-**Bloons Adventure Time TD** on Switch homebrew. It contains no game code and no
+**Bloons Adventure Time TD** v1.7.7 on Switch homebrew. It contains no game code and no
 game assets — it loads the game's own libraries and recreates, natively, the
 thin Android/JNI layer the Unity engine expects.
 
