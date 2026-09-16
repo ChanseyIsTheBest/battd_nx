@@ -403,32 +403,67 @@ int main(int argc, char *argv[]) {
   bp_resolve_game_root(argc, argv);
   battd_video_init(bp_game_root());   /* reads videos/manifest.txt; starts nothing */
   bp_config_load();   /* config.txt: resolution, before anything sizes a buffer */
-
-  bp_net_init();   /* sockets + nifm; see bp_net.c */
-  bp_savetool_run();   /* save.txt -> Profile.Save, before the engine reads it */
+  /* Before anything can fault. __libnx_exception_handler needs a descriptor it
+   * did not have to allocate: it runs with the process stopped and possibly
+   * with the heap lock held by the thread that faulted. */
+  crash_log_init();
+  wd_log_init();
+  io_log_init();
+  /* IS OUR OWN BSS WRITABLE? A crash dump said no: a write into a static
+   * buffer in the middle of bss took a permission fault at a page boundary,
+   * and nothing in this port changes page permissions there. Either the
+   * loader mapped part of the 23 MB bss (ffmpeg's FFT tables, mostly) without
+   * write, or something remapped over it. Walk it once and say which, so the
+   * next static buffer that silently lands on such a page is not another
+   * mystery crash. Bounded: a handful of regions. */
+  { extern char __bss_start__[], __bss_end__[];
+    u64 a = (u64)(uintptr_t)__bss_start__, end = (u64)(uintptr_t)__bss_end__;
+    int regions = 0, bad = 0;
+    while (a < end && regions < 64) {
+      MemoryInfo mi; u32 pi;
+      if (R_FAILED(svcQueryMemory(&mi, &pi, a))) break;
+      const u64 rs = mi.addr < a ? a : mi.addr;
+      const u64 re = mi.addr + mi.size < end ? mi.addr + mi.size : end;
+      const int rw = (mi.perm & Perm_R) && (mi.perm & Perm_W);
+      if (!rw) bad++;
+      debugPrintf("[mem] bss region %d: %p +0x%llx type=%u perm=%c%c%c attr=0x%x%s\n",
+                  regions, (void *)(uintptr_t)rs, (unsigned long long)(re - rs),
+                  (unsigned)mi.type,
+                  (mi.perm & Perm_R) ? 'R' : '-', (mi.perm & Perm_W) ? 'W' : '-',
+                  (mi.perm & Perm_X) ? 'X' : '-', (unsigned)mi.attr,
+                  rw ? "" : "   *** NOT WRITABLE ***");
+      regions++;
+      if (mi.addr + mi.size <= a) break;
+      a = mi.addr + mi.size;
+    }
+    debugPrintf("[mem] bss: %d region(s) over %llu MB, %d not writable\n",
+                regions, (unsigned long long)((end - (u64)(uintptr_t)__bss_start__) >> 20), bad);
+  }
+  /* The NRO's own layout, once, so a crash report can be symbolised without
+   * reconstructing the base from a bss anchor. */
+  { extern char __start__[];
+    extern char __bss_start__[], __bss_end__[];
+    MemoryInfo mi; u32 pi;
+    debugPrintf("[mem] NRO: _start=%p bss=%p..%p\n", (void *)__start__, (void *)__bss_start__, (void *)__bss_end__);
+    if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u64)(uintptr_t)__start__)))
+      debugPrintf("[mem] NRO text block: %p +0x%llx type=0x%x perm=%c%c%c\n",
+                  (void *)(uintptr_t)mi.addr, (unsigned long long)mi.size, (unsigned)mi.type,
+                  (mi.perm & Perm_R) ? 'R' : '-', (mi.perm & Perm_W) ? 'W' : '-', (mi.perm & Perm_X) ? 'X' : '-'); }
   debugPrintf("[boot] === battd_nx (Bloons Adventure Time TD, Unity 2020.3.40f1 / IL2CPP) ===\n");
-  bp_root_report(argc, argv);
+  bp_root_report(argc, argv);   /* first in the log: every run starts with this */
 
-  /* Title override leaves the cwd at the .nro folder or at the SD root
-   * depending on how it was launched, and the engine opens plenty of things by
-   * relative path. Pin it. */
-  if (chdir(bp_game_root()) != 0)
-    debugPrintf("[boot] WARNING: chdir(%s) failed\n", bp_game_root());
-
-  check_syscalls();
-  debugPrintf("[boot] syscalls ok\n");
-  check_memory();
-
-  /* FastLoad clocks for the load path. Module loading, relocation and the first
-   * scene are all CPU-bound and single-threaded; this is the difference between
-   * a boot that feels broken and one that feels slow. Turned off before the
-   * frame loop so it does not cost battery for the whole session. */
-  cpu_boost(1);
-  debugPrintf("[boot] CPU boost ON for the load path\n");
-
-  /* Verify the staged tree BEFORE loading anything. A missing catalog.bin is a
-   * five-second fix if it is named now, and an unexplained hang forty seconds
-   * in if it is not. */
+  /* ---------------------------------------------------------------------
+   * ASSETS BEFORE NETWORK.
+   *
+   * This used to sit AFTER bp_net_init(), which brought nifm and the sockets up
+   * and then left them idle while the pack was opened -- an 83 MB read -- or, on
+   * a first boot, BUILT, which takes about a minute. The game then started with
+   * a network connection that had been sitting unused for that whole time.
+   *
+   * Nothing between here and the engine needs the network, so it now comes up
+   * last, immediately before the game can use it. The slow, purely local work
+   * happens first.
+   * ------------------------------------------------------------------- */
   /* ---- asset pack ------------------------------------------------------
    * This game ships 1,224 loose asset files (83 MB). Horizon is slow to open
    * and stat files individually and fsdev holds a handle per open, so a tree
@@ -485,9 +520,49 @@ int main(int argc, char *argv[]) {
       debugPrintf("[pack] not active -- serving loose files from %s\n", adir);
   }
 
+  bp_net_init();   /* sockets + nifm; see bp_net.c. LAST, so the connection is
+                    * fresh when the engine starts -- see the note above. */
+  bp_savetool_run();   /* save.txt -> Profile.Save, before the engine reads it */
+
+  /* Title override leaves the cwd at the .nro folder or at the SD root
+   * depending on how it was launched, and the engine opens plenty of things by
+   * relative path. Pin it. */
+  if (chdir(bp_game_root()) != 0)
+    debugPrintf("[boot] WARNING: chdir(%s) failed\n", bp_game_root());
+
+  check_syscalls();
+  debugPrintf("[boot] syscalls ok\n");
+  check_memory();
+
+  /* FastLoad clocks for the load path. Module loading, relocation and the first
+   * scene are all CPU-bound and single-threaded; this is the difference between
+   * a boot that feels broken and one that feels slow. Turned off before the
+   * frame loop so it does not cost battery for the whole session. */
+  cpu_boost(1);
+  debugPrintf("[boot] CPU boost ON for the load path\n");
+
+  /* Verify the staged tree BEFORE loading anything. A missing catalog.bin is a
+   * five-second fix if it is named now, and an unexplained hang forty seconds
+   * in if it is not. */
+
   /* Verify the staged tree. With the pack live this checks the index; without
    * it, the loose files. Either way a missing file is named now rather than
    * surfacing as an unexplained hang forty seconds into the boot. */
+  /* Freeze which cache entries may be held in RAM. Must happen before the
+   * engine starts: anything written after this point is deliberately not
+   * eligible, which is what makes holding the rest safe. */
+  { extern void bp_ram_freeze_cache_set(const char *root);
+    bp_ram_freeze_cache_set(bp_game_root()); }
+
+  /* Loading held files happens here, on a low-priority thread, so no open()
+   * ever waits on an SD read of a whole file. */
+  { extern void bp_ram_load_all(void); bp_ram_load_all(); }
+
+  /* Started AFTER the bulk load, so the bulk load is not idle-gated against a
+   * game that has not started yet. From here it only picks up files that appear
+   * later, and those do wait for a quiet card. */
+  { extern void bp_ram_prefetch_start(void); bp_ram_prefetch_start(); }
+
   if (bp_assets_init() < 0)
     fatal_error("No assets found under %s.\n\n"
                 "Stage the game from your own APK:\n"

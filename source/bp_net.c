@@ -16,6 +16,7 @@
  * ------------------------------------------------------------------------- */
 #include <stdio.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,58 +32,282 @@
 static int s_sock_ok, s_nifm_ok;
 
 /* ---- offline once the content is cached (maintainer's request) ------------------
- * When every AssetBundle in bp_cache_manifest.h is already in the Unity cache, the
+ * When the Unity cache has not changed since the previous launch, the
  * game has nothing left to download: boot with the internet OFF, so it goes straight
  * to its cached content instead of re-checking and retrying. Keyed on content hash:
  * when Ninja Kiwi ships changed bundles the hashes no longer match, the check fails
  * and the game stays online to fetch them. <root>/force_online forces online. */
-#include "bp_cache_manifest.h"
-#include <sys/stat.h>
 const char *bp_game_root(void);
 static int s_offline;
 int bp_net_is_offline(void) { return s_offline; }
+/* Written by bp_net_shim.c when a DNS lookup is refused while offline, i.e.
+ * when the cache turned out to be less complete than the manifest claimed.
+ * Consumed and deleted by the next boot, which therefore runs online. */
+void bp_net_request_online_next_boot(void) {
+  char p[700];
+  snprintf(p, sizeof p, "%s/online_once", bp_game_root());
+  struct stat st;
+  if (stat(p, &st) == 0) return;                 /* already asked */
+  FILE *f = fopen(p, "w");
+  if (!f) return;
+  fputs("Written automatically: something was missing from the cache, so the\n"
+        "next launch will come up online to fetch it. This file deletes itself\n"
+        "at that launch. Safe to remove by hand.\n", f);
+  fclose(f);
+  debugPrintf("[net] cache was incomplete -- the next launch will come up "
+              "online (wrote %s)\n", p);
+}
+
+/* Count what is ACTUALLY on the card, and name anything the manifest does not
+ * know about.
+ *
+ * This exists because a redownload was blamed on an incomplete cache when the
+ * real fault was this port holding Unity's __info bookkeeping in RAM. Guessing
+ * from the outside was the mistake; the card can simply be counted. If the
+ * total here exceeds BP_CACHE_MANIFEST_COUNT, the manifest is stale and
+ * tools/gen_cache_manifest.py will fix it. If it matches, the cache is exactly
+ * what the manifest says and any redownload is the port's fault, not yours. */
+/* Walk the cache to any depth, recording every complete entry.
+ *
+ * DEPTH IS NOT FIXED. Unity names a cache entry after the URL, and this game
+ * fetches DLC from paths like ".../Android/talkingheads/audio" -- so the entry
+ * lands at Shared/talkingheads/audio/<hash>/, three levels down, not two. The
+ * census, the manifest generator and the offline check all assumed exactly
+ * Shared/<id>/<hash>/ and were blind to anything deeper. A card holding the DLC
+ * bundles would still have reported "30 of 30", the port would have gone offline
+ * satisfied, and the game would have asked to download files that were sitting
+ * on the card the whole time.
+ *
+ * An entry is any directory holding a non-empty __data with an __info beside it;
+ * the walk does not descend past one. `rel` is the path under Shared/, which may
+ * itself contain slashes -- that is the id the manifest stores. */
+static void walk_cache(const char *dir, const char *rel, int depth,
+                       void (*hit)(const char *rel, long size, void *ctx), void *ctx) {
+  if (depth > 6) return;
+  char data[1400], info[1400];
+  struct stat st, si;
+  snprintf(data, sizeof data, "%s/__data", dir);
+  snprintf(info, sizeof info, "%s/__info", dir);
+  if (stat(data, &st) == 0 && st.st_size > 0 && stat(info, &si) == 0) {
+    hit(rel, (long)st.st_size, ctx);
+    return;                                  /* an entry is a leaf */
+  }
+  DIR *d = opendir(dir);
+  if (!d) return;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL) {
+    if (e->d_name[0] == '.') continue;
+    char sub[1200], subrel[700];
+    snprintf(sub, sizeof sub, "%s/%s", dir, e->d_name);
+    snprintf(subrel, sizeof subrel, "%s%s%s", rel, rel[0] ? "/" : "", e->d_name);
+    struct stat sd;
+    if (stat(sub, &sd) != 0 || !S_ISDIR(sd.st_mode)) continue;
+    walk_cache(sub, subrel, depth + 1, hit, ctx);
+  }
+  closedir(d);
+}
+
+typedef struct { int n; unsigned long long bytes; } FpCtx;
+static void fp_hit(const char *rel, long size, void *ctx) {
+  (void)rel;
+  FpCtx *f = ctx;
+  f->n++;
+  f->bytes += (unsigned long long)size;
+}
+
+/* A fingerprint of what is cached: how many complete entries, and how many
+ * bytes of __data. Bookkeeping churn does not move it -- Unity rewrites __info
+ * constantly and that is not counted -- so it changes only when a bundle is
+ * actually added, replaced or removed. */
+static void cache_state_path(const char *root, char *out, size_t n) {
+  snprintf(out, n, "%s/cache_state", root);
+}
+static int cache_state_read(const char *root, FpCtx *out) {
+  char p[760];
+  cache_state_path(root, p, sizeof p);
+  FILE *f = fopen(p, "r");
+  if (!f) return 0;
+  int n = 0; unsigned long long b = 0;
+  const int got = fscanf(f, "%d %llu", &n, &b);
+  fclose(f);
+  if (got != 2) return 0;
+  out->n = n; out->bytes = b;
+  return 1;
+}
+static void cache_state_write(const char *root, const FpCtx *in) {
+  char p[760];
+  cache_state_path(root, p, sizeof p);
+  FILE *f = fopen(p, "w");
+  if (!f) return;
+  fprintf(f, "%d %llu\n", in->n, in->bytes);
+  fclose(f);
+}
+
+static int cache_fingerprint(const char *root, FpCtx *out) {
+  char shared[700];
+  snprintf(shared, sizeof shared, "%s/files/UnityCache/Shared", root);
+  struct stat st;
+  out->n = 0; out->bytes = 0;
+  if (stat(shared, &st) != 0) return 0;
+  walk_cache(shared, "", 0, fp_hit, out);
+  return 1;
+}
+
+/* A plain inventory of what is on the card. It used to compare against
+ * bp_cache_manifest.h and report entries as "MISSING" -- but that manifest was
+ * a snapshot baked in at build time, so once the game legitimately cached a
+ * different version of something, the report accused a perfectly good cache of
+ * being incomplete. Nothing gates on it now, so it states facts and stops. */
+static void cache_census(const char *root) {
+  FpCtx f;
+  if (!cache_fingerprint(root, &f)) {
+    debugPrintf("[net] cache census: no %s/files/UnityCache/Shared yet\n", root);
+    return;
+  }
+  debugPrintf("[net] cache census: %d complete entries, %llu MB on the card\n",
+              f.n, f.bytes >> 20);
+}
+
 static int offline_decision(void) {
 #if BP_OFFLINE_WHEN_CACHED
   char p[700];
   struct stat st;
   const char *root = bp_game_root();
+  /* Unconditional: this is a diagnostic, and it used to sit below the
+   * force_online / online_once short-circuits -- so the launches that most
+   * needed the inventory were exactly the ones that printed none. */
+  cache_census(root);
   snprintf(p, sizeof p, "%s/force_online", root);
   if (stat(p, &st) == 0) {
     debugPrintf("[net] %s present: staying online\n", p);
     return 0;
   }
-  const int total = (int)(sizeof k_bp_cache_manifest / sizeof k_bp_cache_manifest[0]);
-  int have = 0, first_missing = -1;
-  for (int i = 0; i < total; i++) {
-    snprintf(p, sizeof p, "%s/files/UnityCache/Shared/%s/%s/__data", root, k_bp_cache_manifest[i].id, k_bp_cache_manifest[i].hash);
-    int ok = stat(p, &st) == 0 && st.st_size > 0;
-    if (ok) {
-      snprintf(p, sizeof p, "%s/files/UnityCache/Shared/%s/%s/__info", root, k_bp_cache_manifest[i].id, k_bp_cache_manifest[i].hash);
-      ok = stat(p, &st) == 0;
-    }
-    if (ok) have++; else if (first_missing < 0) first_missing = i;
+  /* One-shot: consume it whether or not we would have gone offline, so it can
+   * never wedge the port online permanently. */
+  /* ---------------------------------------------------------------------
+   * NO CONNECTION -> OFFLINE, whatever the rest of the logic would decide.
+   *
+   * Coming up "online" without a connection is strictly worse than offline.
+   * Both fail every lookup, but online ALSO reports the network as reachable,
+   * so the game makes its normal startup calls -- server time, account, config
+   * -- waits for each to fail, and does not fall back to what it already has.
+   * Offline reports NotReachable and it skips them.
+   *
+   * This is what a full cache and no internet looked like before: 30 of 30
+   * entries present, no bundle ever requested, and the only error in the log
+   * was api.ninjakiwi.com/utility/time -- purely because the convergence rule
+   * had chosen an online launch after the cache changed. The cache was fine.
+   * The port was telling the game to phone home.
+   *
+   * force_online still wins, above: that is an explicit instruction.
+   * ------------------------------------------------------------------- */
+  if (!bp_net_online()) {
+    debugPrintf("[net] no internet connection -> OFFLINE (nothing is gained by "
+                "reporting the network up when it is not; the game would just "
+                "try, fail, and not use what it already has)\n");
+    return 1;
   }
-  if (have != total) {
-    /* Still downloading. config.txt "online" is deliberately ignored here: the
-     * first run has to fetch the content, and a setting that could block that
-     * would present as a game that never finishes loading. */
-    debugPrintf("[net] cache: %d of %d bundles present (first missing %s/%s) -> online%s\n",
-                have, total,
-                k_bp_cache_manifest[first_missing].id, k_bp_cache_manifest[first_missing].hash,
-                bp_allow_online ? "" : " (config.txt online=false ignored until the download finishes)");
+
+  snprintf(p, sizeof p, "%s/online_once", root);
+  if (stat(p, &st) == 0) {
+    /* Only spend it on a launch that can actually download. With no connection,
+     * coming up "online" achieves nothing except letting the game try, fail and
+     * complain -- while ALSO telling it the network is reachable, so it does not
+     * fall back to what it already has. Keep the marker for a launch that can
+     * use it. */
+    if (bp_net_online()) {
+      remove(p);
+      debugPrintf("[net] online_once was set by a previous launch: coming up "
+                  "online this once to finish downloading, then back to "
+                  "offline\n");
+      return 0;
+    }
+    debugPrintf("[net] online_once is set but there is no internet -- keeping it "
+                "for a launch that can use it, and playing from the cache\n");
+  }
+  /* ---------------------------------------------------------------------
+   * THE GATE IS "NOTHING WAS DOWNLOADED LAST SESSION", NOT A BAKED MANIFEST.
+   *
+   * bp_cache_manifest.h pins exact content hashes, which made it stale the
+   * moment the game cached a different version of anything -- and the only cure
+   * was pulling the SD card and re-running a tool. That is a chore to hand a
+   * user, and it kept the port online long after everything had in fact been
+   * downloaded.
+   *
+   * The honest signal is simpler and needs no tooling: if the cache is exactly
+   * what it was at the previous launch, then that launch downloaded nothing, so
+   * there is nothing left to fetch. It converges on its own -- a launch that
+   * downloads something changes the fingerprint, the next launch comes up
+   * online and downloads nothing, and the one after that goes offline.
+   * ------------------------------------------------------------------- */
+  FpCtx fp;
+  cache_fingerprint(root, &fp);
+  if (fp.n == 0) {
+    debugPrintf("[net] nothing cached yet -> online\n");
+    cache_state_write(root, &fp);
+    return 0;
+  }
+  FpCtx prev;
+  const int had = cache_state_read(root, &prev);
+  cache_state_write(root, &fp);
+  if (!had) {
+    debugPrintf("[net] first launch with a cache (%d entries, %llu MB) -> online "
+                "this once, so anything still missing can arrive\n",
+                fp.n, fp.bytes >> 20);
+    return 0;
+  }
+  if (prev.n != fp.n || prev.bytes != fp.bytes) {
+    debugPrintf("[net] cache changed since the last launch (%d entries/%llu MB "
+                "-> %d/%llu MB) -> online, in case more is coming\n",
+                prev.n, prev.bytes >> 20, fp.n, fp.bytes >> 20);
     return 0;
   }
   if (bp_allow_online) {
-    debugPrintf("[net] cache complete (%d bundles) but config.txt has online=true "
-                "-> staying connected\n", total);
+    debugPrintf("[net] cache settled (%d entries, %llu MB, unchanged since the "
+                "last launch) but config.txt has online=true -> staying "
+                "connected\n", fp.n, fp.bytes >> 20);
     return 0;
   }
-  debugPrintf("[net] OFFLINE: all %d cached bundles present and config.txt has "
-              "online=false -> internet disabled (set online=true, or create "
-              "%s/force_online, to download updates)\n", total, root);
+  debugPrintf("[net] OFFLINE: cache settled (%d entries, %llu MB, unchanged "
+              "since the last launch) -> internet disabled (set online=true, or "
+              "create %s/force_online, to download updates)\n",
+              fp.n, fp.bytes >> 20, root);
   return 1;
 #endif
   return 0;
+}
+
+/* Re-record the cache while the game runs.
+ *
+ * The state used to be written only at boot, so a launch that downloaded
+ * something recorded the count from BEFORE its own download. The next launch
+ * then saw a change and came up online purely to confirm, and only the third
+ * went offline. Three launches to settle, when the player had everything after
+ * the first.
+ *
+ * Refreshing periodically records the post-download state instead, so the very
+ * next launch sees no change and goes offline. If a download lands after a
+ * refresh the next launch comes up online, which is the safe direction and
+ * settles on the one after. A walk of thirty-odd directories once a minute is
+ * not worth measuring. */
+void bp_net_cache_state_refresh(void) {
+#if BP_OFFLINE_WHEN_CACHED
+  static uint64_t next_ns;
+  const uint64_t now = armTicksToNs(armGetSystemTick());
+  if (now < next_ns) return;
+  next_ns = now + 60ull * 1000000000ull;          /* once a minute */
+  FpCtx fp;
+  const char *root = bp_game_root();
+  if (!cache_fingerprint(root, &fp) || fp.n == 0) return;
+  static int last_n = -1;
+  static unsigned long long last_bytes;
+  if (fp.n == last_n && fp.bytes == last_bytes) return;   /* nothing new */
+  last_n = fp.n; last_bytes = fp.bytes;
+  cache_state_write(root, &fp);
+  debugPrintf("[net] cache now %d entries / %llu MB -- recorded, so the next "
+              "launch can go offline without another confirming run\n",
+              fp.n, fp.bytes >> 20);
+#endif
 }
 
 void bp_net_init(void) {

@@ -75,10 +75,10 @@
 
 /* Landscape resolution from config.txt at boot (bp_config.c): 1280x720 up to
  * 1920x1080, snapped to a 16:9 size. Render and window are the SAME buffer. */
-extern int bp_res_w, bp_res_h, bp_portrait_rot;
+extern int bp_res_w, bp_res_h, bp_portrait_rot;   /* rot unused: landscape */
 /* config.txt ui_scale / memory_mb -- see bp_screen.c for what they select. */
 extern float bp_ui_dpi;
-extern int   bp_memory_mb;   /* bp_portrait_rot unused; kept for ABI */
+extern int   bp_memory_mb;
 #define BP_RENDER_W      bp_res_w
 #define BP_RENDER_H      bp_res_h
 #define BP_WINDOW_W      bp_res_w     /* landscape: window == render */
@@ -128,18 +128,20 @@ extern int screen_height;
 /* ---------------------------------------------------------------------------
  * OFFLINE-WHEN-CACHED
  *
- * Once every AssetBundle in bp_cache_manifest.h is present under
- * <root>/files/UnityCache/Shared/<id>/<hash>/ -- non-empty __data with an
- * __info beside it -- the internet is switched off:
- *   Application.internetReachability reports NotReachable
- *   getaddrinfo fails every lookup
- *   connect refuses anything but loopback
+ * The internet is switched off once the cache has SETTLED -- once a launch
+ * finds it byte-for-byte what the launch before found, which means the previous
+ * session downloaded nothing and there is nothing left to fetch. Offline means
+ * internetReachability reports NotReachable, getaddrinfo fails every lookup,
+ * and connect refuses anything but loopback.
  *
- * The manifest pins the CONTENT HASH of each bundle, not just its name. That is
- * deliberate: a content update from Ninja Kiwi produces different hashes, the
- * check fails, and the game stays online and fetches the new bundles instead of
- * running forever on stale ones. The failure direction is always "go online",
- * which is the safe one.
+ * This replaced a baked-in manifest of content hashes. That manifest went stale
+ * the moment the game cached a different version of anything, and the only cure
+ * was pulling the SD card and re-running a tool -- so the port sat online long
+ * after everything had in fact been downloaded, with nothing to tell the player
+ * why. The settled test needs no tooling and converges by itself: a launch that
+ * downloads something comes up online, the next downloads nothing, and the one
+ * after that goes offline. The fingerprint counts __data entries and bytes, so
+ * Unity rewriting its __info bookkeeping does not disturb it.
  *
  * An empty file <root>/force_online overrides it for a launch. Regenerate the
  * manifest after a content change:
@@ -155,11 +157,76 @@ extern int screen_height;
  *   online = false  (default)  stay offline and play from the cache
  *   online = true              keep the internet on, so content updates arrive
  *
- * It has NO EFFECT until every bundle in bp_cache_manifest.h is present -- the
- * first run has to download, and a setting that could block that would just
- * look like a broken game. While the cache is incomplete the port is online
- * regardless, and the log says the setting is being ignored and why. */
+ * An earlier revision defaulted this to true, on the theory that the game needed
+ * a server round-trip to resolve its DLC and that offline was therefore
+ * destructive. That was wrong. The bundles were being corrupted by a fortified
+ * read bypassing the read-ahead layer (see __read_chk_fake in libc_shim.c);
+ * Unity then re-fetched and evicted them, and offline mode took the blame.
+ * It has NO EFFECT until the cache has settled -- the first run has to
+ * download, and a setting that could block that would just look like a broken
+ * game. Until then the port is online regardless, and the log says so. */
 extern int bp_allow_online;
+
+/* config.txt "mt_sample": the [mt] managed-frame sampler in diag.c.
+ *
+ * DEFAULTS OFF. It pauses UnityMain, grabs its context, resumes it, then walks
+ * 16 KB of a stack that is live again while it walks -- and emits each frame to
+ * BOTH logs, so every line takes g_stall_lock and g_log_lock in turn. Two boots
+ * in a row ended with the watchdog stopping partway through one of these dumps
+ * and never polling again, at the same point in the splash. That is not proof
+ * the sampler is at fault; it is the reason to be able to take it out of the
+ * picture in one line rather than argue about it. Set to 1 to turn it back on. */
+extern int bp_mt_sample;
+
+/* config.txt "ram_delay_ms": a timing experiment, default 0 (off).
+ *
+ * The syscall sequence on an evicted bundle is IDENTICAL between the RAM path
+ * and the card path for 293 ops -- same reads, same seeks, same positions,
+ * verified same bytes -- and then Unity closes the file on RAM and keeps
+ * loading on the card. The one input that differs is time: the card spends
+ * seconds on an 11 MB bundle and the RAM path spends microseconds, so on RAM
+ * every bundle is in flight at once and finishes before the splash. When set,
+ * the RAM path sleeps this long before answering the FIRST read after each
+ * open of a cache entry. If that alone stops the eviction, Unity is reacting
+ * to speed and the next question is what it does in that window. */
+extern int bp_ram_delay_ms;
+
+/* config.txt "ram_skip_tail": 1 = leave bundles whose blocks-info is at the
+ * END of the file (the three DLC bundles Unity kept rejecting when served from
+ * the old per-file blob store) on the card. 0 = make them resident too, from
+ * the single immutable image. Default 0: the image is the fix under test, and
+ * this is the switch back to the known-working state if it is not. */
+extern int bp_ram_skip_tail;
+
+/* config.txt "diag_io": 0 (default) = only the instruments that write nothing
+ * until they fire. 1 = the full set: the per-close syscall op log to io.log
+ * with a commit per block, the whole-blob CRC at close, the 2 s watchdog
+ * beacon with a commit each, the 1 Hz debug.log flush. The full set was on
+ * for every run that died at the map-scene load, and it is a plausible cause
+ * of the console going down: dozens of fsFsCommit calls in the burst where
+ * the game loads its largest scene. */
+extern int bp_diag_io;
+
+/* config.txt "mmap_arena_mb": the anonymous-mmap arena carved from the heap
+ * at first use (default 768). Unity's 512 MB Dynamic Heap lives in it; the
+ * rest is headroom for its other big maps. The [mem] line reports the arena's
+ * high-water mark so this can be sized to what the game actually uses. */
+extern int bp_mmap_arena_mb;
+
+/* config.txt "ram_max_file_mb": cache bundles larger than this stay on the
+ * card (default 64). The point of residency is the small per-character
+ * bundles the game streams mid-play; shared_stuff at 118 MB is loaded once,
+ * behind a loading screen, and holding it costs a sixth of what Unity has
+ * left. 0 = no limit. */
+extern int bp_ram_max_file_mb;
+
+/* config.txt "gpu_arena_mb": the contiguous slab nouveau's 64KB..64MB buffers
+ * come from (default 384). It was a hardcoded 512 sized by guesswork; the
+ * [mem] line now reports the real peak, which measured 302 MB in a run that
+ * reached the map. Floor is 96. Undersizing shows up as nouveau_bo_new
+ * returning NULL -> GL_OUT_OF_MEMORY -> the compositor wedge this arena
+ * exists to prevent, so leave margin over the measured peak. */
+extern int bp_gpu_arena_mb;
 
 /* ---- TLS ------------------------------------------------------------------
  * BP_TLS_VERIFY_DIAG logs refused chains (flags, subject/issuer per cert) and
@@ -204,6 +271,104 @@ extern int bp_allow_online;
 #ifndef LOAD_ADDRESS
 #define LOAD_ADDRESS 0xC0000000
 #endif
+/* ---------------------------------------------------------------------------
+ * RAM CACHE
+ *
+ * The console grants this port about 2.9 GB of newlib heap and the whole game
+ * is far smaller, so the files it reads repeatedly are held in memory:
+ *
+ *   assets.nxpack   ~83 MB   every asset read becomes a memcpy, and the global
+ *                            pack I/O mutex drops out of the hot path entirely
+ *   UnityCache      ~244 MB  each AssetBundle is read from the card once per
+ *                            boot no matter how often Unity opens and closes it
+ *
+ * Both draw on ONE budget so they cannot between them overrun it. Anything that
+ * does not fit falls back to the 1 MB read-ahead window, which is what the port
+ * did before -- residency is an optimisation, never a requirement.
+ *
+ * config.txt "ram_cache" overrides the megabyte figure at runtime; 0 turns
+ * residency off. BP_RAM_RESIDENT_MAX_MB caps any single file, so one unexpected
+ * giant file cannot swallow the whole budget. */
+/* 512, because everything is loaded at boot now and everything is 326 MB:
+ * 83 MB of packed assets plus 243 MB of downloaded content. At 256 the boot
+ * load would stop two thirds of the way through and the rest would be read from
+ * the card all session, which is the situation this replaced. */
+#define BP_RAM_CACHE_MB         512
+
+/* ---------------------------------------------------------------------------
+ * VERIFY EVERY CACHED READ AGAINST THE FILE
+ *
+ * Five rounds of this cache have each ended the same way: a real bug found, a
+ * fix that looked sound, and something else broken on the next hardware run.
+ * The reason is that a wrong cached read is INVISIBLE -- it does not fault or
+ * return an error, it returns plausible bytes, and the first symptom is Unity
+ * deciding an AssetBundle is corrupt several seconds later. Every diagnosis so
+ * far has been reconstructed backwards from that, and most were wrong.
+ *
+ * With this on, every read served from RAM is compared against the same range
+ * read from the real file. A mismatch is reported with the descriptor, the
+ * offset, the length and the first differing byte -- which turns "Unity says
+ * the bundle is corrupt" into "this read at this offset returned these bytes
+ * instead of those". It costs a second read per cached read, so it is a
+ * debugging aid rather than a shipping setting, but it is the only way to stop
+ * guessing.
+ *
+ * BACK ON, and this time it can actually prove something. It was switched off
+ * after reporting zero failures -- but that was while the fb_key bug had the
+ * cache serving 1-2% of reads, so it verified almost nothing. The hit rate is
+ * now 100%, and an A/B says the game evicts entries with the cache on and does
+ * not with it off. Either the bytes served differ from the file, or they do
+ * not and the cause is elsewhere; this answers that in one run instead of
+ * another round of theories.
+ *
+ * Set to 0 once the cache is proven. */
+/* TWO CHECKS, TWO SWITCHES. They were one, and that hid a cost.
+ *
+ * BP_RAM_VERIFY       -- at load, on the prefetch thread, once per file: the
+ *                        whole blob compared against the card before anything
+ *                        can read it. Cheap, off the game's threads, and the
+ *                        one that catches a bad load. Stays ON.
+ *
+ * BP_RAM_VERIFY_READS -- per READ, on the game's own thread: re-read the same
+ *                        range from the card and compare. This is the one the
+ *                        comment below was written about, and it was left at 1.
+ *                        It makes every RAM-served read ALSO a card read, so a
+ *                        cache meant to remove SD I/O from the bundle-load burst
+ *                        instead doubles it there, from six Background Job
+ *                        workers at once, into ONE shared static 64 KB buffer
+ *                        with no lock (the reports it produced contradicted
+ *                        each other against the reference archive for exactly
+ *                        that reason). With ram_cache = 0 none of this runs and
+ *                        the game plays through; with 512 it freezes at the end
+ *                        of the splash, when that burst begins. This is the
+ *                        only code on the read path that differs between those
+ *                        two configurations besides a memcpy.
+ *
+ *                        OFF. Turn it to 1 only to re-test correctness, and
+ *                        expect it to cost the boot while it is on.
+ *
+ * Original note, kept because it was right: "it reads the same range from the
+ * file for EVERY cached read, so the cache saves no I/O at all and doubles the
+ * syscall load on a card the game is already waiting on." */
+#define BP_RAM_VERIFY       1
+#define BP_RAM_VERIFY_READS 0
+/* Per-file cap. It exists to stop one pathological file swallowing the budget,
+ * NOT to exclude the biggest real one -- at 64 MB it was rejecting
+ * shared_stuff (112.5 MB), which is the single most-read bundle the game has.
+ * The largest observed is 112.5 MB, the whole working set is 327 MB (83 MB pack
+ * + 244 MB cache), so 192 leaves room for a bundle to grow and still refuses
+ * anything absurd. */
+/* 64, not 192. The 112 MB shared_stuff blob fragments the heap as much as it
+ * fills it, and a single allocation that large is exactly what the game was
+ * later refused. Big files still get the read-ahead window. */
+/* 192, so shared_stuff (112 MB) is included -- at 64 the single largest and
+ * most-read bundle in the game was excluded. Holding a block that size was a
+ * fragmentation risk before; there are now two escapes from a failed large
+ * allocation (the cache releases everything and the GPU arena lends its
+ * reserve), so it is affordable. */
+#define BP_RAM_RESIDENT_MAX_MB  192
+extern int bp_ram_cache_mb;      /* config.txt ram_cache, defaults to the above */
+
 #define BP_GPU_ARENA_MB 320
 #define GFX_RESERVE_MB  192u
 

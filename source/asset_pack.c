@@ -12,6 +12,7 @@
 
 #include "asset_pack.h"
 #include "error.h"
+#include "util.h"   /* debugPrintf */
 
 #define PACK_VERSION 2u
 #define PACK_HANDLES 512
@@ -101,6 +102,28 @@ static uint64_t fnv_bytes(uint64_t hash, const void *data, size_t size) {
   return hash;
 }
 
+/* ---------------------------------------------------------------------------
+ * THE WHOLE PACK IN RAM
+ *
+ * Every asset read lands in pread_entry() or read_handle_at(), and both end in
+ * read_at() on the .nxpack. Holding the pack in memory turns each of those into
+ * a memcpy, and removes two costs, not one:
+ *
+ *   - the SD round trip, which on Horizon is milliseconds per call;
+ *   - g_pack_io_lock. pread_entry takes a GLOBAL mutex around its read, so
+ *     every asset read in the game serialises against every other one. Resident
+ *     reads need no lock at all: the blob is immutable once loaded.
+ *
+ * Budget comes from config.h (BP_RAM_CACHE_MB) and config.txt (ram_cache).
+ * If the allocation or the read fails, g_pack_blob stays NULL and everything
+ * falls back to file I/O -- the pack still works, just at SD speed.
+ * ------------------------------------------------------------------------- */
+static unsigned char *g_pack_blob;
+static uint64_t       g_pack_blob_size;
+
+long bp_ram_cache_take(long bytes);      /* libc_shim.c owns the shared budget */
+void bp_ram_cache_give(long bytes);
+
 static int read_at(int fd, void *buffer, size_t size, uint64_t offset) {
   if (lseek(fd, (off_t)offset, SEEK_SET) < 0) return 0;
   size_t done = 0;
@@ -110,6 +133,15 @@ static int read_at(int fd, void *buffer, size_t size, uint64_t offset) {
     done += (size_t)got;
   }
   return 1;
+}
+
+/* Prefer the resident copy; fall back to the file when it is not loaded. */
+static int pack_read_at(int fd, void *buffer, size_t size, uint64_t offset) {
+  if (g_pack_blob && offset + size <= g_pack_blob_size) {
+    memcpy(buffer, g_pack_blob + offset, size);
+    return 1;
+  }
+  return read_at(fd, buffer, size, offset);
 }
 
 static int write_all(int fd, const void *buffer, size_t size) {
@@ -308,6 +340,84 @@ failed:
   return 0;
 }
 
+/* Read the whole .nxpack into memory. Best effort in every direction: if the
+ * budget is spent, the file cannot be sized, malloc fails or the read comes up
+ * short, the blob is dropped and reads go back to the file. Nothing downstream
+ * needs to know which happened. */
+static void load_pack_blob(void) {
+  struct stat st;
+  if (g_pack_fd < 0 || fstat(g_pack_fd, &st) != 0 || st.st_size <= 0) return;
+  const long want = (long)st.st_size;
+  if (bp_ram_cache_take(want) != want) {
+    debugPrintf("[pack] %ld MB would not fit the RAM cache budget -- reading from SD\n",
+                want >> 20);
+    return;
+  }
+  unsigned char *blob = malloc((size_t)want);
+  if (!blob) {
+    bp_ram_cache_give(want);
+    debugPrintf("[pack] could not allocate %ld MB -- reading from SD\n", want >> 20);
+    return;
+  }
+  if (!read_at(g_pack_fd, blob, (size_t)want, 0)) {
+    free(blob);
+    bp_ram_cache_give(want);
+    debugPrintf("[pack] short read loading the pack -- reading from SD\n");
+    return;
+  }
+  /* Prove the copy COMPLETELY before trusting it.
+   *
+   * This sampled 64 entries and passed, which is worth exactly as much as any
+   * other spot check: a systematic error shows up, a localised one need not.
+   * The pack is the last thing the RAM cache still does during the boots being
+   * investigated, so "probably fine" is not good enough -- compare the whole
+   * thing. One extra read of 83 MB at startup, which is a fair price for
+   * removing a suspect instead of leaving it half-cleared.
+   *
+   * On any mismatch the copy is dropped and the file is used, so a failure here
+   * costs speed and nothing else. */
+  {
+    const size_t CH = 1u << 20;
+    unsigned char *tmp = malloc(CH);
+    if (!tmp) {
+      free(blob);
+      bp_ram_cache_give(want);
+      debugPrintf("[pack] no memory to verify the resident copy -- reading from SD\n");
+      return;
+    }
+    long off = 0;
+    int bad = 0;
+    while (off < want) {
+      const size_t n = (size_t)(want - off) < CH ? (size_t)(want - off) : CH;
+      if (!read_at(g_pack_fd, tmp, n, (uint64_t)off)) { bad = 1; break; }
+      if (memcmp(tmp, blob + off, n) != 0) {
+        size_t k = 0;
+        while (k < n && tmp[k] == blob[off + k]) k++;
+        debugPrintf("[pack] VERIFY FAILED at pack offset %ld (+%zu): "
+                    "resident %02x, file %02x\n",
+                    off, k, blob[off + k], tmp[k]);
+        bad = 1;
+        break;
+      }
+      off += (long)n;
+    }
+    free(tmp);
+    if (bad) {
+      free(blob);
+      bp_ram_cache_give(want);
+      debugPrintf("[pack] resident copy REJECTED -- serving from the card instead\n");
+      return;
+    }
+    debugPrintf("[pack] resident copy verified in full against the file "
+                "(%ld MB compared, every byte)\n", want >> 20);
+  }
+
+  g_pack_blob = blob;
+  g_pack_blob_size = (uint64_t)want;
+  debugPrintf("[pack] resident: %ld MB in RAM, %u entries served without SD reads\n",
+              want >> 20, (unsigned)g_entry_count);
+}
+
 int asset_pack_open_existing(const char *root) {
   if (g_pack_fd >= 0) return 1;
   char pack_path[768], index_path[768];
@@ -324,6 +434,7 @@ int asset_pack_open_existing(const char *root) {
   g_pack_fd = fd;
   snprintf(g_pack_path, sizeof g_pack_path, "%s", pack_path);
   g_error[0] = 0;
+  load_pack_blob();
   return 1;
 }
 
@@ -733,8 +844,13 @@ static long pread_entry(uint32_t entry_index, void *buffer, size_t count, uint64
   if (offset >= entry->size) return 0;
   uint64_t available = entry->size - offset;
   if ((uint64_t)count > available) count = (size_t)available;
+  const uint64_t at = entry->offset + offset;
+  if (g_pack_blob && at + count <= g_pack_blob_size) {
+    memcpy(buffer, g_pack_blob + at, count);   /* immutable: no lock needed */
+    return (long)count;
+  }
   mutexLock(&g_pack_io_lock);
-  int ok = read_at(g_pack_fd, buffer, count, entry->offset + offset);
+  int ok = read_at(g_pack_fd, buffer, count, at);
   mutexUnlock(&g_pack_io_lock);
   return ok ? (long)count : -1;
 }
@@ -745,7 +861,7 @@ static long read_handle_at(PackHandle *handle, void *buffer, size_t count, uint6
   if (offset >= entry->size) return 0;
   uint64_t available = entry->size - offset;
   if ((uint64_t)count > available) count = (size_t)available;
-  return read_at(handle->fd, buffer, count, entry->offset + offset) ? (long)count : -1;
+  return pack_read_at(handle->fd, buffer, count, entry->offset + offset) ? (long)count : -1;
 }
 
 long asset_pack_read_fd(int fd, void *buffer, size_t count) {

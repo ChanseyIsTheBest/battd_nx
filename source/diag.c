@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 #include "diag.h"
-#include "util.h"   /* stallPrintf -- see below, NOT debugPrintf */
+#include "util.h"   /* wdPrintf: lock-free, pre-opened, committed -- NOT debugPrintf */
 
 /* EVERY line in this file must use stallPrintf, never debugPrintf.
  * debugPrintf takes a global mutex; the thread this file exists to report
@@ -22,6 +22,7 @@
  * starting "[wd]" but missed two that start "\n[wd]", and the watchdog went
  * silent for four runs -- stall.log contained only the arm line. */
 #include "so_util.h" /* so_find_module_by_addr for backtrace symbolication */
+#include "config.h"  /* bp_mt_sample */
 
 /* ------------------------------------------------------------------ tunables */
 #define DIAG_MAX_THREADS   96
@@ -279,8 +280,8 @@ static void dump_thread_context(const char *name, const ThreadContext *ctx) {
   char a[40], b[40];
   resolve_addr(a, sizeof a, ctx->pc.x);
   resolve_addr(b, sizeof b, ctx->lr);
-  stallPrintf("[wd]   %s  PC=%s  LR=%s\n", name, a, b);
-  stallPrintf("[wd]     SP=0x%llx FP=0x%llx X0=0x%llx X1=0x%llx X2=0x%llx\n",
+  wdPrintf("[wd]   %s  PC=%s  LR=%s\n", name, a, b);
+  wdPrintf("[wd]     SP=0x%llx FP=0x%llx X0=0x%llx X1=0x%llx X2=0x%llx\n",
               (unsigned long long)ctx->sp, (unsigned long long)ctx->fp,
               (unsigned long long)ctx->cpu_gprs[0].x,
               (unsigned long long)ctx->cpu_gprs[1].x,
@@ -300,7 +301,7 @@ static void dump_thread_context(const char *name, const ThreadContext *ctx) {
     const uint64_t lr     = ((const uint64_t *)(uintptr_t)fp)[1];
     if (!lr) break;
     char s[40]; resolve_addr(s, sizeof s, lr);
-    stallPrintf("[wd]     bt[%d] %s\n", depth, s);
+    wdPrintf("[wd]     bt[%d] %s\n", depth, s);
     if (nextfp <= fp) break;   /* fp must climb up the stack */
     fp = nextfp;
   }
@@ -335,7 +336,7 @@ static void dump_thread_context(const char *name, const ThreadContext *ctx) {
       int is_blr = (prev & 0xFFFFFC1Fu) == 0xD63F0000u;
       if (!is_bl && !is_blr) continue;
       char s[48]; resolve_addr(s, sizeof s, v);
-      stallPrintf("[wd]     ret@0x%-4llx %s%s\n", (unsigned long long)(addr - sp), s,
+      wdPrintf("[wd]     ret@0x%-4llx %s%s\n", (unsigned long long)(addr - sp), s,
                   is_blr ? " (via blr)" : "");
       printed++;
     }
@@ -350,21 +351,65 @@ static void dump_thread_context(const char *name, const ThreadContext *ctx) {
  * snap_resume() releases it. Nothing between them may log. */
 static Mutex g_pause_lock;
 /* Never pause a thread that holds a log lock: wait (bounded, 50 ms) for it to
- * let go. Called with g_pause_lock held; drops it while waiting. */
+ * let go. Called with g_pause_lock held; drops it while waiting.
+ *
+ * IT GIVES UP AND PAUSES ANYWAY. That is deliberate -- a collector waiting
+ * forever is worse -- but until now nothing recorded when it happened, so
+ * "the 50 ms bound is being exceeded" was unfalsifiable from a log.
+ *
+ * Counters only. This runs with g_pause_lock held, inside the collector's
+ * stop-the-world, on whichever thread the bridge called in on; a log call from
+ * here is the exact hazard the function exists to prevent. Read them from the
+ * frame loop with diag_log_wait_stats(). */
+static volatile unsigned g_wait_gaveup;     /* times the bound expired and we paused anyway */
+static volatile unsigned g_wait_waited;     /* times we had to wait at all */
+static volatile unsigned g_wait_worst_us;   /* longest wait that DID resolve */
 static void wait_not_logging(DiagThread *t) {
   for (int i = 0; i < 500; i++) {
     const uint32_t h = t->handle;
-    if (util_log_lock_owner() != h && util_stall_lock_owner() != h) return;
+    if (util_log_lock_owner() != h && util_stall_lock_owner() != h) {
+      if (i) {
+        g_wait_waited++;
+        const unsigned us = (unsigned)i * 100u;
+        if (us > g_wait_worst_us) g_wait_worst_us = us;
+      }
+      return;
+    }
     mutexUnlock(&g_pause_lock);
     svcSleepThread(100000ull);
     mutexLock(&g_pause_lock);
   }
+  g_wait_gaveup++;     /* suspending a thread that still owns a log lock */
+}
+void diag_log_wait_stats(unsigned *gaveup, unsigned *waited, unsigned *worst_us) {
+  if (gaveup)   *gaveup   = g_wait_gaveup;
+  if (waited)   *waited   = g_wait_waited;
+  if (worst_us) *worst_us = g_wait_worst_us;
 }
 const char *diag_name_for_handle(uint32_t h) {
   if (!h) return "none";
   for (int i = 0; i < DIAG_MAX_THREADS; i++)
     if (g_threads[i].in_use && g_threads[i].handle == h) return g_threads[i].name[0] ? g_threads[i].name : "?";
   return "unregistered";
+}
+/* What that thread is doing, from the beacon it already publishes. Three
+ * volatile reads -- no pause, no stack walk, nothing that can fault.
+ *
+ * "debug.log lock held >2s by (Background Job.Worker 1)" has named the holder
+ * for several rounds and never said what it was doing, which is the difference
+ * between a lead and a finding. A holder parked in a wait is a different bug
+ * from one grinding inside vfprintf on a full buffer, and the beacon separates
+ * them for free. */
+const char *diag_state_for_handle(uint32_t h) {
+  if (!h) return "none";
+  for (int i = 0; i < DIAG_MAX_THREADS; i++) {
+    const DiagThread *t = &g_threads[i];
+    if (!t->in_use || t->handle != h) continue;
+    const int kind = t->wait_kind;
+    return (kind == DIAG_W_NONE) ? "running (not in any registered wait)"
+                                 : wait_kind_name(kind);
+  }
+  return "not in the thread registry";
 }
 static Result snap_pause(DiagThread *t) {
   mutexLock(&g_pause_lock);
@@ -385,7 +430,7 @@ static void snapshot_thread(DiagThread *t) {
   Result pr = snap_pause(t);
   Result gr = R_SUCCEEDED(pr) ? svcGetThreadContext3(&ctx, t->handle) : pr;
   if (R_SUCCEEDED(pr)) snap_resume(t);
-  if (R_FAILED(gr)) { stallPrintf("[wd]   %-16s (snapshot failed rc=0x%x)\n", t->name, gr); return; }
+  if (R_FAILED(gr)) { wdPrintf("[wd]   %-16s (snapshot failed rc=0x%x)\n", t->name, gr); return; }
   /* Scan the stack only for the threads whose wait we actually need to diagnose:
    * the main render/UI thread and the async loaders. */
   g_scan_stack = (strstr(t->name, "Main") || strstr(t->name, "Preload") ||
@@ -469,14 +514,14 @@ static void sample_managed_frames(void) {
        * spent a whole cycle invisible because it wrote to stall.log while
        * debug.log was the file being sent. A diagnostic nobody reads is worth
        * nothing; ~600 bounded lines in debug.log is a trivial price. */
-      stallPrintf("[mt] --- managed frames on UnityMain ---\n");
+      wdPrintf("[mt] --- managed frames on UnityMain ---\n");
       debugPrintf("[mt] --- managed frames on UnityMain ---\n");
     }
     {
       unsigned long long off =
           (unsigned long long)(v - (uint64_t)(uintptr_t)m->load_virtbase);
       if (off < IL2CPP_MANAGED_BASE) { native++; continue; }   /* native runtime */
-      stallPrintf("[mt] il2cpp+0x%llx\n", off);
+      wdPrintf("[mt] il2cpp+0x%llx\n", off);
       debugPrintf("[mt] il2cpp+0x%llx\n", off);
       printed++;
     }
@@ -488,12 +533,12 @@ static void dump_threads(int episode, uint64_t now) {
    * contexts and stacks; a bad pointer there kills this thread outright, and
    * that is what happened -- stall.log held one beacon and then nothing, with no
    * stall header, so the crash was inside the dump rather than the detector. */
-  stallPrintf("[wd] dump_threads: entered\n");
+  wdPrintf("[wd] dump_threads: entered\n");
   uint64_t stalled_ns = tick_to_ns(now - g_last_progress);
-  stallPrintf("\n[wd] ===== STALL #%d : no frame progress for %llu.%llus (last frame=%d) =====\n",
+  wdPrintf("\n[wd] ===== STALL #%d : no frame progress for %llu.%llus (last frame=%d) =====\n",
               episode, (unsigned long long)(stalled_ns / 1000000000ull),
               (unsigned long long)((stalled_ns % 1000000000ull) / 100000000ull), g_frame);
-  stallPrintf("[wd] %-16s %-10s %-11s %-18s %7s  d_wait d_wake d_spin\n",
+  wdPrintf("[wd] %-16s %-10s %-11s %-18s %7s  d_wait d_wake d_spin\n",
               "name", "tid", "state", "wait_obj", "secs");
   for (int i = 0; i < DIAG_MAX_THREADS; i++) {
     DiagThread *t = &g_threads[i];
@@ -512,7 +557,7 @@ static void dump_threads(int episode, uint64_t now) {
     prev_waits[i] = t->waits_total;
     prev_wakes[i] = t->wakes_total;
     prev_spins[i] = t->futex_spins;
-    stallPrintf("[wd] %-16s %-10llu %-11s 0x%-16llx %3llu.%llu  %6llu %6llu %6llu%s\n",
+    wdPrintf("[wd] %-16s %-10llu %-11s 0x%-16llx %3llu.%llu  %6llu %6llu %6llu%s\n",
                 t->name[0] ? t->name : "?",
                 (unsigned long long)t->tid,
                 wait_kind_name(kind),
@@ -523,14 +568,15 @@ static void dump_threads(int episode, uint64_t now) {
                 (unsigned long long)dspin,
                 t->is_main_engine ? "  <engine_main>" : "");
   }
-  stallPrintf("[wd] legend: d_* = delta since previous dump (0/0/0 == hard-parked; "
+  wdPrintf("[wd] legend: d_* = delta since previous dump (0/0/0 == hard-parked; "
               "d_spin>0 == alive on futex; d_wait>d_wake == entered a wait it hasn't left)\n");
   /* native backtrace: where each thread is wedged inside libunity/il2cpp/NRO */
-  stallPrintf("[wd] --- thread CPU contexts (frame-pointer backtrace) ---\n");
+  wdPrintf("[wd] --- thread CPU contexts (frame-pointer backtrace) ---\n");
   for (int i = 0; i < DIAG_MAX_THREADS; i++) {
     if (g_threads[i].in_use) snapshot_thread(&g_threads[i]);
   }
-  stallPrintf("\n");
+  wdPrintf("\n");
+  rawlog_commit();                 /* the dump is on the card as a unit; beacons are not committed */
 }
 
 static void watchdog_main(void *unused) {
@@ -556,9 +602,9 @@ static void watchdog_main(void *unused) {
      * makes the NEXT failure distinguishable from a dead watchdog thread. */
     {
       static uint64_t last_beat;
-      if (tick_to_ns(now - last_beat) >= 2000000000ull) {
+      if (tick_to_ns(now - last_beat) >= (bp_diag_io ? 2000000000ull : 10000000000ull)) {
         last_beat = now;
-        stallPrintf("[wd] alive: frame=%d idle=%llums%s\n",
+        wdPrintf("[wd] alive: frame=%d idle=%llums%s\n",
                     g_frame, (unsigned long long)(tick_to_ns(idle) / 1000000ull),
                     tick_to_ns(idle) >= DIAG_STALL_NS ? "  STALLED" : "");
       }
@@ -598,7 +644,8 @@ static void watchdog_main(void *unused) {
       /* 60 samples over two minutes rather than 30 over one: every stall so far
        * has been diagnosed well after the first minute, and the earlier samples
        * are the least interesting ones (the boot is still legitimately busy). */
-      if (mt_n < 60 && (mt_last == 0 || tick_to_ns(now - mt_last) >= 2000000000ull)) {
+      if (bp_mt_sample &&
+          mt_n < 60 && (mt_last == 0 || tick_to_ns(now - mt_last) >= 2000000000ull)) {
         mt_last = now; mt_n++;
         sample_managed_frames();
       }
@@ -610,7 +657,7 @@ static void watchdog_main(void *unused) {
       if (t0 == 0) t0 = now;
       if (hb_done < DIAG_HEARTBEAT_MAX &&
           tick_to_ns(now - t0) >= (uint64_t)DIAG_HEARTBEAT_SEC[hb_done] * 1000000000ull) {
-        stallPrintf("\n[wd] ===== HEARTBEAT #%d at ~%ds (frames ARE advancing; "
+        wdPrintf("\n[wd] ===== HEARTBEAT #%d at ~%ds (frames ARE advancing; "
                     "this is not a stall) =====\n", hb_done + 1,
                     DIAG_HEARTBEAT_SEC[hb_done]);
         dump_threads(-(++hb_done), now);
@@ -651,10 +698,10 @@ void diag_watchdog_start(void) {
     if (R_SUCCEEDED(rc)) { used = PRIOS[i]; break; }
   }
   if (R_SUCCEEDED(rc) && R_SUCCEEDED(threadStart(&g_wd_thread)))
-    stallPrintf("[wd] watchdog armed (stall=%llus, poll=1s, prio=0x%02x)\n",
+    wdPrintf("[wd] watchdog armed (stall=%llus, poll=1s, prio=0x%02x)\n",
                 (unsigned long long)(DIAG_STALL_NS / 1000000000ull), used);
   else
-    stallPrintf("[wd] watchdog FAILED to start rc=0x%x\n", rc);
+    wdPrintf("[wd] watchdog FAILED to start rc=0x%x\n", rc);
 }
 
 

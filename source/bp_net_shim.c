@@ -687,12 +687,57 @@ static int map_eai(int rc) {
   return 4;                                     /* EAI_FAIL */
 }
 
+
+/* Does a refused lookup for this host mean the game is missing CONTENT?
+ *
+ * Services say nothing about the cache: Unity Gaming Services config, Ninja
+ * Kiwi's account and server-time APIs, and anything already on the ads and
+ * telemetry list are all asked for on every launch whether or not a single byte
+ * is missing. Only the CDN that serves AssetBundles is evidence.
+ *
+ * The list is deliberately of things to IGNORE rather than things to trust: a
+ * host this port has never seen should count, because missing that signal
+ * leaves the game stuck, while an extra online boot costs one launch. */
+static int lookup_means_missing_content(const char *host) {
+  static const char *const ignore[] = {
+    "unity3d.com", "unity.com",              /* UGS config, analytics, crash   */
+    "api.ninjakiwi.com",                     /* account, server time           */
+    "googleapis.com", "google.com", "gstatic.com",
+    "facebook.com", "fbcdn.net",
+    NULL
+  };
+#if BP_NET_BLOCK_ADS
+  /* Guarded: host_blocked() itself lives inside this #if, so calling it
+   * unconditionally would break the build with BP_NET_BLOCK_ADS 0. */
+  if (host_blocked(host)) return 0;          /* ads/telemetry: never content   */
+#endif
+  for (int i = 0; ignore[i]; i++)
+    if (strstr(host, ignore[i])) return 0;
+  return 1;
+}
+
 int bpn_getaddrinfo(const char *node, const char *svc, const void *hints, void **res) {
   if (!res) return 4;
   *res = NULL;
   if (bp_net_is_offline()) {                        /* cached content: no lookups */
-    static int told;
-    if (!told) { told = 1; debugPrintf("[net] offline mode: DNS disabled (first lookup: %s)\n", node ? node : "-"); }
+    static int told, asked;
+    if (!told) {
+      told = 1;
+      debugPrintf("[net] offline mode: DNS disabled (first lookup: %s)\n", node ? node : "-");
+    }
+    /* A refused lookup for CONTENT means the cache was less complete than the
+     * manifest claimed, and the next launch should come up online to finish.
+     *
+     * But only for content. The first refused lookup of every offline boot is
+     * config.uca.cloud.unity3d.com -- Unity Gaming Services config, which the
+     * game asks for unconditionally and which no amount of downloading will
+     * ever satisfy. Treating that as evidence wrote the marker on EVERY offline
+     * boot, so offline never stuck and the port simply alternated online and
+     * offline for ever. */
+    if (!asked && node && lookup_means_missing_content(node)) {
+      asked = 1;
+      bp_net_request_online_next_boot();
+    }
     return 8;                                       /* bionic EAI_NONAME */
   }
 #if BP_NET_BLOCK_ADS

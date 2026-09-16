@@ -49,10 +49,12 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "battd_video.h"
+#include "asset_pack.h"
 #include "util.h"
 
 #if BATTD_VIDEO
@@ -102,8 +104,12 @@ static int  s_inited;
  * "jar:file://!/assets/<name>.mp4" and calls Play(), so the URL names the file
  * outright and there is nothing to duration-match on. Rather than duplicate the
  * launch sequence below, the path is stashed here and the normal play path
- * uses it verbatim. Absolute, and it goes through fopen -- so the asset pack
- * serves it and the clips do NOT have to be staged loose in videos/. */
+ * uses it verbatim. Absolute, in the form "<root>/assets/<name>".
+ *
+ * NOT served by fopen. The pack is wired into the guest's open() via
+ * libc_shim, not into this file's own C, and main.c deletes the loose assets/
+ * tree once the pack is verified. clip_locate() and read_clip() ask the pack
+ * directly; see the note on clip_locate(). */
 static char s_forced_path[320];
 
 /* Trim trailing CR/LF/space in place. */
@@ -381,6 +387,42 @@ static void colour_setup(enum AVColorSpace cs, enum AVColorRange cr, int h) {
  * already had the engine park inside a blocking filesystem call for 48 seconds,
  * and doing it while a video is on screen would be worse than not playing one. */
 static uint8_t *read_clip(const DecodeArgs *a, int *out_size) {
+  /* Pack first -- see clip_locate(). The whole-file case is one read_all; the
+   * ranged case (a clip embedded in data.unity3d, itself a pack entry) is a
+   * pread of just that window, so a 100 MB container is not copied to get a
+   * 2 MB clip out of it. Same malloc'd-buffer contract as the loose path. */
+  if (asset_pack_active()) {
+    uint64_t psize = 0;
+    if (asset_pack_stat_path(a->path, &psize, NULL)) {
+      if (a->size) {
+        if ((uint64_t)(a->offset + a->size) > psize) {
+          debugPrintf("[video] %s: range %llu+%llu runs past the end of the pack "
+                      "entry (%llu) -- assets replaced without a rescan?\n", a->label,
+                      (unsigned long long)a->offset, (unsigned long long)a->size,
+                      (unsigned long long)psize);
+          return NULL;
+        }
+        if (a->size <= 1024 || a->size > 256ull * 1024 * 1024) return NULL;
+        uint8_t *d = malloc((size_t)a->size);
+        if (!d) return NULL;
+        const int pfd = asset_pack_open_path(a->path);
+        long got = -1;
+        if (pfd >= 0) {
+          got = asset_pack_pread_fd(pfd, d, (size_t)a->size, (long)a->offset);
+          asset_pack_close_fd(pfd);
+        }
+        if (got != (long)a->size) { free(d); return NULL; }
+        *out_size = (int)a->size;
+        return d;
+      }
+      void *d = NULL; size_t n = 0;
+      if (!asset_pack_read_all_path(a->path, &d, &n)) return NULL;
+      if (n <= 1024 || n > 256ull * 1024 * 1024) { free(d); return NULL; }
+      *out_size = (int)n;
+      return d;
+    }
+  }
+
   FILE *f = fopen(a->path, "rb");
   if (!f)
     return NULL;
@@ -742,6 +784,24 @@ static void *decode_thread(void *ud) {
   s_eof_tick = tick_ns();
 
 done:
+  /* THE GAME IS RELEASED HERE, BEFORE THE SUMMARY LINE, AND THAT ORDER MATTERS.
+   *
+   * s_playing is the only thing battd_il2cpp_pump() watches to know the clip is
+   * over and the splash may exit. It used to be cleared at the very end of
+   * this function, after the "[video] finished:" line -- a flush-on-sight
+   * prefix, so debugPrintf writes it to the card before returning. If that
+   * write does not return, s_playing stays 1 forever, the pump never fires,
+   * TriggerAnimationExit is never called, and the game sits on the last frame
+   * of the clip. That is precisely "hangs at the end of the Ninja Kiwi logo",
+   * and the log from that run ends one line before this one would appear.
+   *
+   * Whether the write blocked is not something this function can know. What
+   * it can do is refuse to make the game's progress depend on a diagnostic
+   * succeeding. Clear the flag first; the decoder is finished either way. The
+   * slots and the EOF hold are independent of the codec contexts freed below,
+   * so the render thread keeps its last frame for EOF_HOLD_NS regardless. */
+  s_playing = 0;
+
   /* Logging here is fine: this is our own thread, not SDL's audio callback and
    * not FMOD's mixer. */
   debugPrintf("[video] finished: %u shown, %u dropped in %.2fs (%.1f fps); "
@@ -770,8 +830,7 @@ done:
   if (iobuf)  av_free(iobuf);
   free(mdata);
 
-  s_playing = 0;
-  return NULL;
+  return NULL;                       /* s_playing was cleared at done: above */
 }
 
 /* ------------------------------------------------------------------ control */
@@ -784,14 +843,40 @@ static void join_thread(void) {
   s_thread_live = 0;
 }
 
+/* WHERE A CLIP'S BYTES ARE.
+ *
+ * The comment on s_forced_path says the path "goes through fopen -- so the
+ * asset pack serves it". It does not, and never did. The pack is wired into the
+ * GUEST's open() through libc_shim; this file is the port's own C, and its
+ * fopen()/stat() go straight to fsdev and the raw sdmc path. main.c deletes the
+ * loose assets/ tree the moment the pack is verified, so that raw path does not
+ * exist -- which is why every clip the splash asked for came back "not found"
+ * and why the game has never once played its intro on this port.
+ *
+ * The APK carries all four as StreamingAssets (assets/NK_splash_sound.mp4,
+ * assets/CNGamesLogo-108024fps.mp4, ...), the pack folds assets/ in, and
+ * asset_pack normalises "<root>/assets/<name>" to the pack key "<name>". So
+ * ask the pack first. A loose file is still honoured for anyone running with
+ * the pack off.
+ *
+ * Returns 1 = pack, 2 = loose file, 0 = nowhere. */
+static int clip_locate(const char *abs_path, uint64_t *size) {
+  if (asset_pack_active() && asset_pack_stat_path(abs_path, size, NULL)) return 1;
+  struct stat st;
+  if (stat(abs_path, &st) == 0 && st.st_size > 0) { *size = (uint64_t)st.st_size; return 2; }
+  return 0;
+}
+
 void battd_video_play_path(const char *abs_path) {
   if (!abs_path || !*abs_path) return;
-  FILE *probe = fopen(abs_path, "rb");
-  if (!probe) {
+  uint64_t vsize = 0;
+  const int where = clip_locate(abs_path, &vsize);
+  if (!where) {
     debugPrintf("[video] %s not found -- clip skipped\n", abs_path);
     return;
   }
-  fclose(probe);
+  debugPrintf("[video] %s: %llu bytes, %s\n", abs_path, (unsigned long long)vsize,
+              where == 1 ? "served from the asset pack" : "loose file on the card");
   snprintf(s_forced_path, sizeof s_forced_path, "%s", abs_path);
   if (s_clip_count == 0) {                 /* no manifest: synthesise one slot */
     memset(&s_clip[0], 0, sizeof s_clip[0]);

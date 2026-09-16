@@ -128,6 +128,10 @@ int z_dup(int fd){
    * managed class (System.Object included) resolved to NULL. Do a real dup;
    * if fsdev can't, fall back to the same fd -- our mmap shim copies the file
    * into RAM eagerly at map time, so reusing/closing the fd afterwards is safe. */
+  /* Hand the descriptor back to the filesystem BEFORE duplicating it. A dup
+   * shares the real file offset, and the read-ahead layer keeps a virtual one
+   * that the duplicate cannot see -- see bp_ra_devirtualise(). */
+  { extern void bp_ra_devirtualise(int fd); bp_ra_devirtualise(fd); }
   int n = dup(fd);
   if (n < 0) n = fd;
   debugPrintf("[io] dup(%d) -> %d\n", fd, n);

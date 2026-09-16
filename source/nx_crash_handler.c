@@ -135,28 +135,25 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
   /* A thread the GC bridge paused may hold the stdio/heap lock the dump needs. */
   diag_resume_all_gc_paused();
   gc_paused_live_reset();
-  /* Push the MAIN log before writing anything else.
+  /* DUMP FIRST. NOTHING THAT CAN BLOCK GOES ABOVE THIS.
    *
-   * The dump below goes to stall.log via stallPrintf, which is unbuffered by
-   * design. debug.log is not: it holds up to LOG_FLUSH_INTERVAL_NS of output in
-   * a 64 KB buffer, and that buffer is where the lines leading UP TO the crash
-   * live -- which are usually the ones worth having.
+   * The previous order put debug_log_flush_force() -- which waits up to 2 s for
+   * the log lock -- and two stallPrintf lines ahead of the dump. The run after
+   * that change got exactly one line out and then stopped: the "tail LOST"
+   * diagnostic landed and the exception dump itself never did. That is worse
+   * than what it replaced, and it was avoidable. The log flush is a nice-to-have;
+   * the PC and the backtrace are the reason this handler exists, so they go
+   * first and everything that can wait goes after.
    *
-   * util.c claimed this call already happened here. It did not; the only caller
-   * was the SD-commit helper in libc_shim.c. That was survivable while the
-   * interval was 2s and half the prefixes flushed immediately, and stopped
-   * being survivable when both of those changed. */
-  { extern void debug_log_flush(void); debug_log_flush(); }
+   * pc/lr/esr/far are on the banner line for the same reason: if the process
+   * dies after one line, that line should still be worth reading. */
+  char b1[96], b2[96];
 
-    char b1[96], b2[96];
-
-    CLOG("\n[crash] ================ USER EXCEPTION ================\n");
-    CLOG("[crash] type=0x%x  esr=%08x  far=%016lx\n",
-         ctx->error_desc, ctx->esr, (unsigned long)ctx->far.x);
-    CLOG("[crash] pc=%s\n", sym(ctx->pc.x, b1, sizeof b1));
-    CLOG("[crash] lr=%s\n", sym(ctx->lr.x, b2, sizeof b2));
-    CLOG("[crash] sp=%016lx  fp=%016lx\n",
-         (unsigned long)ctx->sp.x, (unsigned long)ctx->fp.x);
+  CLOG("\n[crash] ===== USER EXCEPTION ===== pc=%s lr=%s esr=%08x far=%016lx type=0x%x\n",
+       sym(ctx->pc.x, b1, sizeof b1), sym(ctx->lr.x, b2, sizeof b2),
+       ctx->esr, (unsigned long)ctx->far.x, ctx->error_desc);
+  CLOG("[crash] sp=%016lx  fp=%016lx\n",
+       (unsigned long)ctx->sp.x, (unsigned long)ctx->fp.x);
 
     for (int i = 0; i < 28; i += 4)
         CLOG("[crash] x%-2d %016lx  x%-2d %016lx  x%-2d %016lx  x%-2d %016lx\n",
@@ -194,6 +191,28 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
     }
 
     CLOG("[crash] ============== END EXCEPTION DUMP ==============\n");
+
+    /* Everything that can block goes here, AFTER the dump is on the card.
+     * debug_log_flush_force() waits up to 2 s for the log lock; the two
+     * stallPrintf lines can be starved silently by the watchdog. None of that
+     * can cost us the backtrace now. */
+    { extern int debug_log_flush_force(void);
+      extern unsigned debug_log_dropped(void);
+      const int flushed = debug_log_flush_force();
+      CLOG("[crash] debug.log tail %s (%u lines already dropped)\n",
+           flushed ? "FLUSHED -- that log is complete"
+                   : "LOST -- the log lock could not be taken; everything since "
+                     "the last flush is missing",
+           debug_log_dropped());
+      { unsigned gaveup = 0, waited = 0, worst_us = 0;
+        diag_log_wait_stats(&gaveup, &waited, &worst_us);
+        CLOG("[crash] GC pause vs log lock: %u gave up after 50ms, %u waited (worst %u us)\n",
+             gaveup, waited, worst_us); }
+      /* One pointer line into stall.log so a reader of the watchdog log knows
+       * where the dump went. Last, because it can be silently dropped. */
+      { extern int stallPrintf(char *text, ...);
+        stallPrintf("[log] crashed -- full dump in crash.log (debug.log tail %s)\n",
+                    flushed ? "flushed" : "LOST"); } }
 
 #if CRASH_REBREAK
     /* re-raise so the process aborts and Atmosphere writes creport too */

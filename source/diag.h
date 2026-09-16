@@ -57,6 +57,15 @@ void diag_frame(int frame);
 /* Spawn the watchdog. Idempotent. Call once after boot, before the loop. */
 void diag_watchdog_start(void);
 
+/* How the GC bridge's "never freeze a thread mid-log" guard is actually doing.
+ * gaveup   = times the 50 ms bound expired and a log-lock holder was suspended
+ *            anyway. Any non-zero value confirms the bound is too short.
+ * waited   = times it had to wait at all;  worst_us = longest wait that resolved.
+ * Counters, not logs: wait_not_logging runs under g_pause_lock inside the
+ * collector's stop-the-world, where logging is the hazard it guards against.
+ * Read this from the frame loop. Any argument may be NULL. */
+void diag_log_wait_stats(unsigned *gaveup, unsigned *waited, unsigned *worst_us);
+
 #ifdef __cplusplus
 }
 #endif
@@ -69,5 +78,6 @@ void diag_resume_all_gc_paused(void);
 int  diag_pause_pthread_ctx(void *target_pthread, ThreadContext *ctx);  /* 1 ctx, 2 no ctx, 0 not paused */
 
 const char *diag_name_for_handle(uint32_t h);  /* registered thread name for a kernel handle */
+const char *diag_state_for_handle(uint32_t h); /* what it is doing, from its wait beacon */
 
 #endif /* DIAG_H */

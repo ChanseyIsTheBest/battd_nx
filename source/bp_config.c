@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "config.h"      /* BP_RAM_CACHE_MB, and cross-checks the externs below */
 #include "bp_config.h"
 #include "unity_jni.h"
 #include "util.h"
@@ -19,16 +20,25 @@ const char *bp_game_root(void);
 
 int bp_res_w = 1280, bp_res_h = 720;
 float bp_ui_dpi   = 320.0f;   /* config.txt ui_scale; drives the art-quality tier */
-int   bp_memory_mb = 2048;
-int   bp_allow_online = 0;   /* config.txt online; only consulted once cached */
-int   bp_art_quality = 2;     /* config.txt art_quality; -1 = auto (no patch) */    /* config.txt memory_mb; the >=1536 gate for high art */
-int bp_portrait_rot = 0;   /* landscape port: unused; config.h externs it */                 /* 1 = 90 CW (right Joy-Con up), 2 = 90 CCW (left Joy-Con up) */
+int   bp_memory_mb = 2048;    /* config.txt memory_mb; the >=1536 gate for high art */
+int   bp_ram_cache_mb = BP_RAM_CACHE_MB;
+int   bp_mt_sample    = 0;   /* [mt] sampler: off unless config.txt asks */
+int   bp_ram_delay_ms = 0;   /* timing experiment, see config.h */
+int   bp_ram_skip_tail = 0;  /* see config.h */
+int   bp_diag_io = 0;        /* see config.h */
+int   bp_mmap_arena_mb = 1280;
+int   bp_gpu_arena_mb  = 448;   /* measured peak 340; not configurable */
+int   bp_ram_max_file_mb = 80;
+extern int bp_cache_lock_mode;   /* libc_shim.c: 0 never, 1 offline-only, 2 always */
+int   bp_allow_online = 0;   /* config.txt online; false = go offline once cached */
+int   bp_art_quality = 2;     /* config.txt art_quality; -1 = auto (no patch) */
+int bp_portrait_rot = 0;      /* landscape port: unused; the headers still extern it */
 
 /* Each setting's block in the template. A config.txt written by an older build
  * that lacks one gets that block appended, so new options show up without the
  * player deleting the file. */
 static const struct { const char *key; const char *block; } SECTIONS[] = {
-  { "resolution",
+    { "resolution",
     "# --- resolution ------------------------------------------------------\n"
     "# The game's landscape resolution, by its \"p\" number (the width):\n"
     "#    1280 -> 1280 x  720   (default, the exact handheld panel)\n"
@@ -37,38 +47,12 @@ static const struct { const char *key; const char *block; } SECTIONS[] = {
     "# Any value from 1280 to 1920 is accepted and rounded to the nearest size that\n"
     "# keeps the exact 9:16 shape. One setting for both handheld and docked.\n"
     "# Higher is sharper (most visible on a TV) but costs performance.\n"
-    "resolution = 1280\n" },
-  { "ui_scale",
-    "# --- ui_scale --------------------------------------------------------\n"
-    "# Screen density reported to the game, as dots-per-inch.\n"
-    "#\n"
-    "# THIS SELECTS THE 2D ART QUALITY. The game picks its asset variant from\n"
-    "# dpi / 160:  below 1.5 it loads the LOW-detail bundles, at or above 1.5 it\n"
-    "# loads the high/ultra ones. The console panel's true density is about 237\n"
-    "# dpi, which works out to 1.48 -- just under the cut, so the honest value\n"
-    "# gets low-detail art. 320 (the standard phone \"xhdpi\" bucket this game's\n"
-    "# UI was drawn for) clears it comfortably.\n"
-    "#\n"
-    "# It also scales any UI set to a constant physical size, so a much larger\n"
-    "# number makes menus bigger. 240 is the smallest value that still gets the\n"
-    "# better art; 320 is the default.\n"
-    "ui_scale = 320\n" },
-  { "art_quality",
-    "# --- art_quality -----------------------------------------------------\n"
-    "# Forces the 2D art tier the game loads, instead of letting it choose from\n"
-    "# screen density and reported RAM.\n"
-    "#   2    = best (default)\n"
-    "#   1    = what the game picked on its own before this was forced; it\n"
-    "#          loads the .low bundles\n"
-    "#   0    = the small-screen tier\n"
-    "#   auto = do not patch at all; the game decides, using ui_scale and\n"
-    "#          memory_mb below\n"
-    "art_quality = 2\n" },
+    "resolution = 1280\n"},
   { "online",
     "# --- online ----------------------------------------------------------\n"
     "# What to do once ALL the downloadable content is cached:\n"
-    "#   false = stay offline and play from the cache (default)\n"
-    "#   true  = keep the internet on, so content updates are picked up\n"
+    "#   false = disable the internet once everything is cached (default)\n"
+    "#   true  = stay connected, so content updates are picked up\n"
     "#\n"
     "# This has NO EFFECT until the download has finished -- the first run has\n"
     "# to fetch about 244 MB, and the port stays online until it has. Once the\n"
@@ -76,17 +60,7 @@ static const struct { const char *key; const char *block; } SECTIONS[] = {
     "#\n"
     "# An empty file named force_online next to the .nro overrides this for one\n"
     "# launch, without editing the file.\n"
-    "online = false\n" },
-  { "memory_mb",
-    "# --- memory_mb -------------------------------------------------------\n"
-    "# Physical RAM reported to the game, in megabytes.\n"
-    "#\n"
-    "# The game asks for this only after it has decided on high-detail art, and\n"
-    "# drops back to the LOW-detail bundles if the answer is under 1536. This\n"
-    "# does NOT change how much memory the port actually uses, and it is not\n"
-    "# what Unity sizes its own heaps from -- that still sees the conservative\n"
-    "# value the shim reports through /proc/meminfo.\n"
-    "memory_mb = 2048\n" },
+    "online = false\n"},
 };
 #define N_SECTIONS ((int)(sizeof SECTIONS / sizeof *SECTIONS))
 
@@ -96,7 +70,13 @@ static const struct { const char *key; const char *block; } SECTIONS[] = {
 static void write_template(const char *path) {
   FILE *f = fopen(path, "w");
   if (!f) { debugPrintf("[config] could not write %s\n", path); return; }
-  fputs("# config.txt -- Bloons Adventure Time TD settings, read at every launch.\n", f);
+  fputs("# config.txt -- Bloons Adventure Time TD settings, read at every launch.\n"
+        "#\n"
+        "# Only these two are settings. Everything else the port used to expose here\n"
+        "# -- the memory arenas, the RAM cache, the art tier, the diagnostics -- is\n"
+        "# now fixed in the build, because those values are tuned against a measured\n"
+        "# memory budget and a wrong one crashes rather than degrades. Lines for the\n"
+        "# old keys are ignored and reported in debug.log as \"unknown setting\".\n", f);
   for (int i = 0; i < N_SECTIONS; i++) fprintf(f, "\n%s", SECTIONS[i].block);
   fclose(f);
   debugPrintf("[config] wrote %s (defaults)\n", path);
@@ -179,27 +159,11 @@ void bp_config_load(void) {
       long v = strtol(val, &end, 10);
       if (end != val && (!*end || !strcmp(end, "p") || !strcmp(end, "P"))) res = (int)v;
       else debugPrintf("[config] resolution \"%s\" is not a number -- using %d\n", val, res);
-    } else if (!strcmp(key, "ui_scale")) {
-      char *end; long v = strtol(val, &end, 10);
-      if (end != val && v >= 96 && v <= 640) bp_ui_dpi = (float)v;
-      else debugPrintf("[config] ui_scale \"%s\" must be 96..640 -- using %d\n", val, (int)bp_ui_dpi);
-    } else if (!strcmp(key, "art_quality")) {
-      if (!strcmp(val, "auto")) bp_art_quality = -1;
-      else {
-        char *end; long v = strtol(val, &end, 10);
-        if (end != val && v >= 0 && v <= 2) bp_art_quality = (int)v;
-        else debugPrintf("[config] art_quality \"%s\" must be 0, 1, 2 or auto -- using %d\n",
-                         val, bp_art_quality);
-      }
     } else if (!strcmp(key, "online")) {
       const int b = parse_flag(val);
       if (b >= 0) bp_allow_online = b;
       else debugPrintf("[config] online \"%s\" must be true or false -- using %s\n",
                        val, bp_allow_online ? "true" : "false");
-    } else if (!strcmp(key, "memory_mb")) {
-      char *end; long v = strtol(val, &end, 10);
-      if (end != val && v >= 256 && v <= 8192) bp_memory_mb = (int)v;
-      else debugPrintf("[config] memory_mb \"%s\" must be 256..8192 -- using %d\n", val, bp_memory_mb);
     } else {
       debugPrintf("[config] unknown setting \"%s\" -- ignored\n", key);
     }
@@ -216,6 +180,23 @@ void bp_config_load(void) {
               (int)bp_ui_dpi, bp_ui_dpi / 160.0f,
               (bp_ui_dpi / 160.0f) >= 1.5f ? "high/ultra" : "LOW");
   debugPrintf("[config] memory_mb %d (>=1536 keeps the high-detail art)\n", bp_memory_mb);
+  debugPrintf("[config] cache_lock %s\n",
+              bp_cache_lock_mode == 0 ? "off: the game may overwrite cached content" :
+              bp_cache_lock_mode == 2 ? "on: cached content is read-only, always" :
+              "offline: cached content is read-only when there is no connection");
+  debugPrintf("[config] mt_sample %s: the [mt] managed-stack sampler is %s\n",
+              bp_mt_sample ? "1" : "0",
+              bp_mt_sample ? "ON (it pauses UnityMain every 2s)" : "off");
+  debugPrintf("[config] mmap_arena_mb %d, gpu_arena_mb %d, ram_max_file_mb %d\n",
+              bp_mmap_arena_mb, bp_gpu_arena_mb, bp_ram_max_file_mb);
+  debugPrintf("[config] diag_io %d: %s\n", bp_diag_io,
+              bp_diag_io ? "HEAVY diagnostics on (io.log, blob CRC, 2s beacon, 1Hz flush)" : "light diagnostics only");
+  debugPrintf("[config] ram_skip_tail %d: blocks-info-at-end bundles are %s\n", bp_ram_skip_tail,
+              bp_ram_skip_tail ? "served from the card" : "resident (image)");
+  if (bp_ram_delay_ms)
+    debugPrintf("[config] ram_delay_ms %d: EXPERIMENT -- first read after each cache-entry open sleeps\n", bp_ram_delay_ms);
+  debugPrintf("[config] ram_cache %d MB%s\n", bp_ram_cache_mb,
+              bp_ram_cache_mb ? "" : " (off: 1 MB read-ahead windows only)");
   debugPrintf("[config] online %s (only applies once the cache is complete)\n",
               bp_allow_online ? "true: stay connected" : "false: go offline when cached");
   if (bp_art_quality >= 0)

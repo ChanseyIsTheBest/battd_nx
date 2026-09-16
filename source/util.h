@@ -13,16 +13,54 @@
 
 int debugPrintf(char *text, ...);
 
+/* Log a line that is ALREADY formatted. Not the same as debugPrintf("%s", line):
+ * the noisy/important tests are applied to the line, not to "%s". Anything
+ * drained from a queue must come through here or it can never force a flush. */
+int debugPuts(const char *line);
+
 /* Force the log buffer to the card. Called by the crash handler and by
  * nx_sd_flush; debugPrintf otherwise flushes on a 2s timer, because flushing
  * per line made the engine spend all of frame 0 inside fsFileWrite. */
 void debug_log_flush(void);
+
+/* Same, but waits out the 2 s even if the log lock is already marked wedged.
+ * Returns 1 if the buffer reached the card, 0 if it was DISCARDED -- a zero
+ * means the tail of debug.log for that run does not exist. Crash path only, and
+ * only after diag_resume_all_gc_paused(). */
+int debug_log_flush_force(void);
+
+unsigned debug_log_wedge_events(void);  /* distinct log-lock wedges this run */
+unsigned debug_log_dropped(void);       /* lines dropped because of them */
 
 /* Watchdog-only log, written to <root>/stall.log through its own FILE* and lock.
  * MUST be used instead of debugPrintf by anything that reports on a stuck
  * thread: debugPrintf holds a mutex across a blocking SD write, so it deadlocks
  * against the very thread being diagnosed. */
 int stallPrintf(char *text, ...);
+
+/* Crash-dump output: <root>/crash.log, NO lock, one handle for the whole dump.
+ * The dump must never be silenced by another thread holding a log mutex, which
+ * is what happened while it went through stallPrintf. Never call this from
+ * anywhere but the exception handler. */
+int crashPrintf(const char *fmt, ...);
+
+/* Open crash.log BEFORE anything can fault. Call once, early in boot. The
+ * handler runs with the whole process stopped and possibly with newlib's heap
+ * lock held by the faulting thread, so it cannot afford to allocate -- which is
+ * what an fopen() in the handler does. */
+void crash_log_init(void);
+
+/* The watchdog's output: <root>/wd.log, same lock-free pre-opened committed
+ * writer as crash.log. Through six frozen boots the watchdog never delivered a
+ * thread dump, and every line of it went through stallPrintf. */
+void wd_log_init(void);
+int  wdPrintf(const char *fmt, ...);
+void rawlog_commit(void);   /* commit wd.log/io.log to the card; call after a dump, not per line */
+
+/* <root>/io.log: the per-entry syscall sequence on cache bundles, one block per
+ * close. Diff a ram_cache=512 run against a ram_cache=0 run. */
+void io_log_init(void);
+int  iolog_write(const char *s, size_t n);
 
 void cpu_boost(int on);
 

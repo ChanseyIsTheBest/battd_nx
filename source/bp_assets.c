@@ -404,10 +404,19 @@ const char *bp_assets_resolve(const char *path, char *out, size_t outsz) {
     static int miss_logged;
     if (miss_logged < 32) {
       miss_logged++;
-      debugPrintf("[assets] miss: '%s' -> %s (not in index; trying anyway)\n",
-                  path, out);
-      if (miss_logged == 32)
-        debugPrintf("[assets] (further misses not logged)\n");
+        /* Queued, not written. This fires from open() AND stat(), both of which
+         * run on Unity's worker threads, and a blocking write from one of those
+         * can stall the game. The ring in libc_shim.c drains it on the main
+         * thread. */
+        { extern void bp_tr_log_line(const char *line);
+          char m_[420];
+          snprintf(m_, sizeof m_,
+                   "[assets] miss: '%s' -> %s (not in index; trying anyway)\n",
+                   path, out);
+          bp_tr_log_line(m_);
+          if (miss_logged == 32)
+            bp_tr_log_line("[assets] (further misses not logged)\n");
+        }
     }
   }
 #endif

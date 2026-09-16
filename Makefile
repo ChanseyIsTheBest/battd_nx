@@ -42,7 +42,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET      := battd_nx
 APP_TITLE   := Bloons Adventure Time TD
 APP_AUTHOR  := ChanseyIsTheBest
-APP_VERSION := 1.0.0
+APP_VERSION := 1.0.1
 # Icon is OPTIONAL.
 #
 # $(wildcard) yields an empty string when the file is not there, and NROFLAGS
@@ -63,7 +63,7 @@ DATA     := data
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
 CFLAGS  := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) \
-           -DCRASH_LOG_PRINTF=stallPrintf \
+           -DCRASH_LOG_PRINTF=crashPrintf \
            $(INCLUDE) -D__SWITCH__
 
 # Promote the mistakes that are silent-but-fatal on AArch64 to hard errors.
@@ -231,6 +231,8 @@ $(BUILD):
 #   make check GAME=out/battd
 check:
 	@test -n "$(GAME)" || (echo "usage: make check GAME=path/to/staged/libs"; exit 1)
+	python3 tools/tucheck.py $(TOPDIR)/source
+	python3 tools/lockcheck.py $(TOPDIR)/source
 	python3 tools/symcheck.py $(GAME) --source source
 
 clean:

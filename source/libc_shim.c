@@ -80,7 +80,25 @@ int __sprintf_chk_fake(char *s, int flag, size_t slen, const char *fmt, ...) {
 
 // fortified read helpers ignore the buffer-size guard
 int   __open_2_fake(const char *path, int flags) { return open_fake(path, flags); }
-long  __read_chk_fake(int fd, void *buf, size_t count, size_t buflen) { (void)buflen; return read(fd, buf, count); }
+/* MUST go through read_fake, not read().
+ *
+ * __read_chk is the _FORTIFY_SOURCE form of read(), and bionic-built libraries
+ * use it pervasively -- libunity included. Calling the real read() here bypasses
+ * the read-ahead layer, and that layer keeps a VIRTUAL file position: it answers
+ * lseek from its own bookkeeping and never moves the real descriptor. So a
+ * fortified read returned bytes from wherever the real fd happened to be left,
+ * which is usually offset 0.
+ *
+ * This was harmless for as long as the read-ahead cache never attached to
+ * anything -- which, because of the `used` flag bug, was its entire history. The
+ * moment that was fixed, every fortified read on a cached file started returning
+ * the wrong bytes: AssetBundles read as corrupt, Unity re-fetched them and
+ * evicted the cached copies, and offline mode looked like it was at fault. It
+ * was not. This line was. */
+long  __read_chk_fake(int fd, void *buf, size_t count, size_t buflen) {
+  (void)buflen;
+  return read_fake(fd, buf, count);
+}
 long  __pread_chk_fake(int fd, void *buf, size_t count, long off, size_t buflen) {
   (void)buflen;
   long cur = lseek(fd, 0, SEEK_CUR);
@@ -475,7 +493,10 @@ void watch_dump(const char *tag, int fd, long a, long b, const void *buf, long g
  * each big read-only fd through a 1MB window filled by one large read, and
  * virtualize the logical file position -- turning ~250k tiny SD reads per MB into
  * a single one. Keyed by fd; the real fd position is used only as our scratch. */
-#define RA_SLOTS 8
+/* 48, not 8: a resident file occupies a slot for as long as it is open, and the
+ * game keeps ~30 AssetBundles open at once. With 8 slots most of them would fall
+ * back to window mode and the residency would quietly do nothing. */
+#define RA_SLOTS 48
 #define RA_WIN   (1u << 20)     /* 1 MB read-ahead window */
 static struct RaCache {
   int  fd;           /* -1 == free */
@@ -484,33 +505,1438 @@ static struct RaCache {
   long base;         /* file offset of buf[0] */
   long len;          /* valid bytes currently in buf */
   unsigned char *buf;
+  int  resident;     /* buf is a borrowed whole-file blob, not our window */
+  int  used;         /* slot occupied. See below -- this is not cosmetic. */
+  const char *blobpath;  /* borrowed from the blob store; for diagnostics only */
 } g_ra[RA_SLOTS];
+/* `used` replaces the old "fd < 0 means free" test, which never worked.
+ * g_ra has static storage, so every slot starts with fd == 0 -- never < 0 --
+ * and ra_attach's search for a free slot found none, every time. The read-ahead
+ * cache has therefore been inert since it was written, here and in the parent
+ * port. Worse, ra_find(0) matched slot 0 on fd equality, so if the loader ever
+ * came up with descriptor 0 free, the first read through it would dereference a
+ * NULL window buffer. Zero-initialised `used` means "free", which is what static
+ * storage actually gives us. */
+
+/* ---------------------------------------------------------------------------
+ * RESIDENT FILES
+ *
+ * The read-ahead window above already turns Unity's tiny field reads into one
+ * SD read per megabyte. Residency goes further: the whole file is held in RAM
+ * and the window never refills, so a bundle that is loaded, closed and loaded
+ * again is read from the card exactly once per boot.
+ *
+ * Keyed by PATH, not by fd, and never freed. That is the point -- Unity opens
+ * and closes AssetBundles repeatedly, and an fd-keyed cache would re-read the
+ * file every time. "Never freed" is affordable because the budget below is
+ * fixed and small next to the 2.9 GB newlib heap this port is granted.
+ *
+ * ra_read() needs no changes for this: a resident slot is simply one whose
+ * window already covers [0, size), so its refill branch never runs.
+ * ------------------------------------------------------------------------ */
+/* 30 cached bundles today, plus whatever else clears the rule. Entries are
+ * 200-odd bytes each, so headroom here is free; the real limit is the byte
+ * budget, not the slot count. */
+#define BLOB_MAX 96
+#define BLOB_HEAD 4096
+static Mutex g_ram_lock;             /* defined below with the budget; the scan needs it early */
+static struct FileBlob {
+  char path[192];
+  unsigned char *data;
+  long size;
+  unsigned char head[BLOB_HEAD];   /* reference copy of the first page, at load */
+  uint32_t crc;                    /* whole-blob checksum, at load */
+  int bad;                         /* already reported corrupt */
+} g_blob[BLOB_MAX];
+static int   g_blob_count;
+
+/* ONE IMAGE, NEVER FREED.
+ *
+ * The blob store used to be a malloc per file, with the pointer lent to every
+ * descriptor that opened the file and three separate paths that could free it
+ * (fb_invalidate, the pressure release, the budget trim) while a slot still
+ * pointed at it. fb_invalidate's own comment records one use-after-free of
+ * exactly that shape. The asset pack -- 1,224 files, zero incidents across
+ * every run -- and the PvZ port's block cache both do the opposite: one arena
+ * allocated once, never freed, descriptors hold offsets into it.
+ *
+ * So: the freeze walk sizes the resident set, one allocation is made for the
+ * lot, and fb_load_now carves from it in order, committing the carve only
+ * after the load and the verify succeed. Dropping an entry marks it dead and
+ * leaves the bytes where they are. Nothing hands out a pointer that anything
+ * can free. If the "zeros on re-open" corruption survives this, it was never
+ * the lifecycle and the canary and blob scan are what will find it. */
+static unsigned char *g_image;
+static size_t         g_image_cap, g_image_used;
+static Mutex          g_load_lock;   /* one load at a time: the carve is tentative until commit */
+
+/* Plain CRC-32 (IEEE), table built once. Boot cost: 243 MB once. */
+static uint32_t blob_crc(const unsigned char *p, size_t n) {
+  static uint32_t T[256]; static int init;
+  if (!init) { for (uint32_t i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1; T[i] = c; } init = 1; }
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; i++) c = T[(c ^ p[i]) & 0xff] ^ (c >> 8);
+  return c ^ 0xFFFFFFFFu;
+}
+
+/* THE INTEGRITY SCAN. No privileged calls, no page tricks: compare each
+ * blob's first page against the copy taken at load, every frame, from the
+ * main thread. 30 x 4 KB is nothing. The first mismatch is reported with the
+ * frame, the entry, the offset of the first differing byte, what is there now
+ * versus what was loaded, how many bytes of the page differ, whether the
+ * damage starts on a page boundary (a mapping event) or not (a store), and
+ * whether the rest of the blob still checksums -- so "zeros" becomes a shape
+ * with a frame number, and the log around that frame names the event. A full
+ * checksum is also run at every close of a resident entry, which is rare, to
+ * catch damage past the first page. */
+static void blob_report(int i, const char *when, unsigned frame) {
+  struct FileBlob *b = &g_blob[i];
+  if (b->bad) return;
+  const size_t n = b->size < (long)BLOB_HEAD ? (size_t)b->size : BLOB_HEAD;
+  size_t first = n, diff = 0;
+  for (size_t k = 0; k < n; k++)
+    if (b->data[k] != b->head[k]) { if (first == n) first = k; diff++; }
+  const uint32_t now = blob_crc(b->data, (size_t)b->size);
+  if (first == n && now == b->crc) return;               /* intact */
+  b->bad = 1;
+  const uintptr_t at = (uintptr_t)b->data + first;
+  debugPrintf("[log] BLOB CORRUPTED %s at frame %u (%s): first page %s (first diff at +%zu = %p, %s page boundary; "
+              "now %02x, loaded %02x; %zu of %zu bytes differ), whole blob %s (crc now %08x, loaded %08x)\n",
+              b->path, frame, when,
+              first == n ? "intact" : "DAMAGED", first, (void *)at,
+              (at & 0xfff) == 0 ? "ON a" : "not on a",
+              first < n ? b->data[first] : 0, first < n ? b->head[first] : 0, diff, n,
+              now == b->crc ? "intact" : "DAMAGED", now, b->crc);
+}
+void bp_ram_blob_scan(unsigned frame) {          /* main thread, once per frame */
+  /* Find under the lock, report outside it: blob_report logs, and logging
+   * under g_ram_lock would park every open of a resident file behind the log
+   * lock. The entry is marked bad before the lock drops so it is reported once. */
+  int hit = -1;
+  mutexLock(&g_ram_lock);
+  for (int i = 0; i < g_blob_count && hit < 0; i++) {
+    struct FileBlob *b = &g_blob[i];
+    if (b->bad || !b->data) continue;
+    const size_t n = b->size < (long)BLOB_HEAD ? (size_t)b->size : BLOB_HEAD;
+    if (memcmp(b->data, b->head, n) != 0) hit = i;
+  }
+  mutexUnlock(&g_ram_lock);
+  if (hit >= 0) blob_report(hit, "frame scan", frame);
+}
+static long  g_ram_budget = -1;          /* bytes left; -1 = not yet initialised */
+
+/* Shared with asset_pack.c, which holds the .nxpack the same way. */
+long bp_ram_cache_take(long bytes) {
+  if (bytes <= 0) return 0;
+  mutexLock(&g_ram_lock);
+  if (g_ram_budget < 0) g_ram_budget = (long)bp_ram_cache_mb << 20;
+  long got = (bytes <= g_ram_budget) ? bytes : 0;
+  g_ram_budget -= got;
+  mutexUnlock(&g_ram_lock);
+  return got;
+}
+void bp_ram_cache_give(long bytes) {
+  if (bytes <= 0) return;
+  mutexLock(&g_ram_lock);
+  g_ram_budget += bytes;
+  mutexUnlock(&g_ram_lock);
+}
+
+/* ---------------------------------------------------------------------------
+ * WHERE DO "DOWNLOADED" BYTES ACTUALLY COME FROM?
+ *
+ * A re-fetch of three bundles (41 MB) reportedly completes faster than the
+ * connection could deliver it. That is a real clue and it fits none of the
+ * explanations offered so far, so measure it rather than argue about it: watch
+ * every descriptor opened for writing under UnityCache, count the bytes and
+ * time them, and report on close.
+ *
+ * 41 MB in eight seconds is a CDN. 41 MB in a fifth of a second is not a
+ * network at all, and then the question becomes which local source is feeding
+ * it -- which the path and size will narrow down immediately.
+ * ------------------------------------------------------------------------ */
+/* Queued, non-blocking log line; the ring and its drain are defined further
+ * down. Declared this early because everything below it that runs on one of
+ * Unity's worker threads must use it rather than debugPrintf -- writing to the
+ * card from those threads is what stalled the log lock past the watchdog's
+ * limit twice. */
+static void tr_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+#define DLW_MAX 16
+static struct { int fd; char path[160]; long bytes; uint64_t t0; } g_dlw[DLW_MAX];
+static Mutex g_dlw_lock;
+
+static void dlw_open(int fd, const char *path) {
+  if (!path || !strstr(path, "/UnityCache/")) return;
+  mutexLock(&g_dlw_lock);
+  for (int i = 0; i < DLW_MAX; i++)
+    if (!g_dlw[i].fd) {
+      g_dlw[i].fd = fd + 1;                 /* +1 so 0 stays "free" */
+      snprintf(g_dlw[i].path, sizeof g_dlw[i].path, "%s", path);
+      g_dlw[i].bytes = 0;
+      g_dlw[i].t0 = armTicksToNs(armGetSystemTick());
+      break;
+    }
+  mutexUnlock(&g_dlw_lock);
+}
+static void dlw_wrote(int fd, long n) {
+  if (n <= 0) return;
+  mutexLock(&g_dlw_lock);
+  for (int i = 0; i < DLW_MAX; i++)
+    if (g_dlw[i].fd == fd + 1) { g_dlw[i].bytes += n; break; }
+  mutexUnlock(&g_dlw_lock);
+}
+static void dlw_close(int fd) {
+  long b = 0; uint64_t ms = 0; char p[160]; p[0] = 0;
+  mutexLock(&g_dlw_lock);
+  for (int i = 0; i < DLW_MAX; i++)
+    if (g_dlw[i].fd == fd + 1) {
+      b = g_dlw[i].bytes;
+      ms = (armTicksToNs(armGetSystemTick()) - g_dlw[i].t0) / 1000000ull;
+      snprintf(p, sizeof p, "%s", g_dlw[i].path);
+      g_dlw[i].fd = 0;
+      break;
+    }
+  mutexUnlock(&g_dlw_lock);
+  if (b > 64 * 1024)
+    tr_log("[dl] wrote %ld KB to %s in %llu ms (%llu KB/s)\n",
+                b >> 10, p, (unsigned long long)ms,
+                (unsigned long long)(ms ? (unsigned long long)(b >> 10) * 1000ull / ms : 0));
+}
+
+/* The path a blob came from, for diagnostics. Borrowed; valid while held. */
+static const char *fb_path_of(const unsigned char *blob) {
+  for (int i = 0; i < g_blob_count; i++)
+    if (g_blob[i].data == blob) return g_blob[i].path;
+  return NULL;
+}
+
+/* ---------------------------------------------------------------------------
+ * LOADING HAPPENS ON A BACKGROUND THREAD, NEVER INSIDE open().
+ *
+ * The first version read the whole file synchronously the first time it was
+ * opened. That put an SD read of the file's entire length inside a single
+ * open() call -- about a second for sfx-ingame (22 MB) or ui-variants (17 MB) --
+ * on whatever thread Unity happened to be loading on. The hardware log shows
+ * sixteen entries and 161 MB going resident between frames 240 and 300, the
+ * watchdog sampling a stalled main thread throughout, and the run dying in the
+ * middle of it.
+ *
+ * A cache that makes the first access slower than not having it is not a cache.
+ * So open() never blocks now: an eligible file is QUEUED, open() returns
+ * immediately and that read goes to the card as it always did, and a later open
+ * of the same file finds the copy ready. For UnityCache bundles -- opened and
+ * closed repeatedly, which is the whole reason they are worth holding -- that
+ * costs one ordinary open and wins every one after it.
+ * ------------------------------------------------------------------------ */
+#define PFQ_MAX 64
+static struct { char path[192]; long size; } g_pfq[PFQ_MAX];
+static int   g_pfq_head, g_pfq_tail;
+static Mutex g_pfq_lock;
+static CondVar g_pfq_cv;
+static Thread  g_pfq_thread;
+static int     g_pfq_running;
+
+static unsigned char *fb_lookup(const char *path, long size);
+static void fb_load_now(const char *path, long size);
+
+static void pfq_push(const char *path, long size) {
+  mutexLock(&g_pfq_lock);
+  const int next = (g_pfq_tail + 1) % PFQ_MAX;
+  if (next != g_pfq_head) {                       /* silently drop when full */
+    int dup = 0;
+    for (int i = g_pfq_head; i != g_pfq_tail; i = (i + 1) % PFQ_MAX)
+      if (!strcmp(g_pfq[i].path, path)) { dup = 1; break; }
+    if (!dup) {
+      snprintf(g_pfq[g_pfq_tail].path, sizeof g_pfq[0].path, "%s", path);
+      g_pfq[g_pfq_tail].size = size;
+      g_pfq_tail = next;
+      condvarWakeOne(&g_pfq_cv);
+    }
+  }
+  mutexUnlock(&g_pfq_lock);
+}
+
+/* When the game last read through this shim. The prefetch thread waits for a
+ * gap before touching the card at all.
+ *
+ * Not blocking open() was necessary but not sufficient: a background thread
+ * reading 100+ MB still saturates the SD device, and every read the game makes
+ * queues behind it. The hardware log shows the watchdog sampling a stalled main
+ * thread all through residency loading. Reads are chunked and only issued when
+ * the game has been quiet, so filling the cache can never make the game wait. */
+static volatile uint64_t g_last_game_read;
+
+/* Is the cache actually doing anything?
+ *
+ * Residency loads a file on the SECOND open, so it only pays off if the game
+ * opens the same file again. If it opens each bundle once per session, every
+ * megabyte held is a megabyte that bought nothing -- which would explain
+ * "loading doesn't really seem improved" exactly, and is not something to guess
+ * at when it can be counted. */
+static volatile uint64_t g_bytes_from_ram, g_bytes_from_card;
+
+static void pfq_wait_for_quiet(void) {
+  for (;;) {
+    const uint64_t now = armTicksToNs(armGetSystemTick());
+    const uint64_t last = g_last_game_read;
+    if (now - last > 250000000ull) return;        /* 250 ms with no game read */
+    svcSleepThread(50000000ull);                  /* 50 ms, then look again   */
+  }
+}
+
+static void pfq_main(void *arg) {
+  (void)arg;
+  for (;;) {
+    char path[192]; long size;
+    mutexLock(&g_pfq_lock);
+    while (g_pfq_running && g_pfq_head == g_pfq_tail)
+      condvarWaitTimeout(&g_pfq_cv, &g_pfq_lock, 200000000ull);
+    if (!g_pfq_running) { mutexUnlock(&g_pfq_lock); return; }
+    snprintf(path, sizeof path, "%s", g_pfq[g_pfq_head].path);
+    size = g_pfq[g_pfq_head].size;
+    g_pfq_head = (g_pfq_head + 1) % PFQ_MAX;
+    mutexUnlock(&g_pfq_lock);
+    fb_load_now(path, size);                      /* the slow part, off the
+                                                   * game's threads entirely */
+  }
+}
+
+/* Once a minute: what the cache is actually buying. */
+void bp_ram_report(void) {
+  static uint64_t next_ns;
+  const uint64_t now = armTicksToNs(armGetSystemTick());
+  if (now < next_ns) return;
+  /* 10 seconds, not 60, and 1 MB rather than 4. Runs that end in five or nine
+   * seconds are the norm while something is being chased, and a report that
+   * needs a minute of uptime never appears in any of them -- this accounting
+   * has been in the build for several rounds and has printed in exactly one. */
+  next_ns = now + 10ull * 1000000000ull;
+  const uint64_t ram = g_bytes_from_ram, card = g_bytes_from_card;
+  const uint64_t tot = ram + card;
+  if (tot < (1u << 20)) return;
+  debugPrintf("[ram] served %llu MB from RAM, %llu MB from the card (%llu%% cached)\n",
+              (unsigned long long)(ram >> 20), (unsigned long long)(card >> 20),
+              (unsigned long long)(tot ? ram * 100 / tot : 0));
+}
+
+void bp_ram_prefetch_start(void) {
+  if (g_pfq_running || bp_ram_cache_mb <= 0) return;
+  g_pfq_running = 1;
+  /* 0x3B is below every game thread: this must never take CPU from rendering. */
+  if (R_FAILED(threadCreate(&g_pfq_thread, pfq_main, NULL, NULL, 0x4000, 0x3B, -2)) ||
+      R_FAILED(threadStart(&g_pfq_thread))) {
+    g_pfq_running = 0;
+    debugPrintf("[ram] could not start the prefetch thread -- residency disabled\n");
+  }
+}
+
+/* Returns a borrowed pointer to the whole file, or NULL to use window mode.
+ * Caller must already know the file is read-only and worth caching. */
+static unsigned char *fb_resident(const char *path, long size) {
+  if (size <= 0 || size > ((long)BP_RAM_RESIDENT_MAX_MB << 20)) return NULL;
+  unsigned char *hit = fb_lookup(path, size);
+  if (hit) return hit;
+  /* Not held yet. Queue it and get out of the way -- this open must not wait
+   * on an SD read of the whole file. */
+  pfq_push(path, size);
+  return NULL;
+}
+
+/* ---------------------------------------------------------------------------
+ * PROTECT COMMITTED CACHE ENTRIES
+ *
+ * Entries under files/UnityCache/Shared keep disappearing, and the routes have
+ * been chased one at a time -- unlink, remove, unlinkat, rename, rmdir -- with a
+ * new one turning up each round. Rather than keep guessing which call does it,
+ * refuse them all.
+ *
+ * NOT the whole directory, though. Unity stages a download at <hash>_tmp/
+ * __data_tmp and cleans it up afterwards; blocking that would leave litter and
+ * break the one path that legitimately writes here. Only COMMITTED entries are
+ * protected -- anything under Shared/ whose path does not contain "_tmp".
+ *
+ * And not always. Offline, a download cannot succeed, so every write here is a
+ * commit that will fail and a delete that costs a file the game already had.
+ * Online, a real update must be able to land. So the default is "locked while
+ * offline", with config.txt able to force it either way.
+ * ------------------------------------------------------------------------ */
+int bp_cache_lock_mode = 1;                 /* 0 = never, 1 = when offline, 2 = always */
+
+static int cache_locked_now(const char *path) {
+  if (!path || bp_cache_lock_mode == 0) return 0;
+  if (!strstr(path, "/UnityCache/Shared/")) return 0;
+  if (strstr(path, "_tmp")) return 0;       /* Unity's own staging: leave alone */
+  if (bp_cache_lock_mode == 2) return 1;
+  { extern int bp_net_is_offline(void); return bp_net_is_offline(); }
+}
+
+/* __data and __info are not the same thing and must not be treated the same.
+ *
+ * __data is content, addressed by the hash in its own path. It never changes,
+ * so refusing writes to it costs nothing.
+ *
+ * __info is BOOKKEEPING. Unity opens it for writing every time it USES an
+ * entry, to stamp the last-used time. The first version of this lock refused
+ * that -- and the log shows it refusing all thirty on one boot:
+ *
+ *   [cache] BLOCKED write-open of .../Shared/ui-variants/<hash>/__info
+ *
+ * Refusing an engine's own bookkeeping is a fine way to make it decide the
+ * entry is unusable and fetch a fresh copy. Writes to __info are allowed;
+ * only its DELETION is refused, because an entry without it counts as
+ * incomplete and is as lost as one without content. */
+static int is_info_file(const char *path) {
+  const char *b = strrchr(path, '/');
+  return b && !strcmp(b, "/__info");
+}
+static int cache_protected_write(const char *path) {
+  return cache_locked_now(path) && !is_info_file(path);
+}
+static int cache_protected_delete(const char *path) {
+  return cache_locked_now(path);
+}
+
+/* Deletes are answered with success rather than an error: the caller is trying
+ * to tidy up something it believes is stale, and telling it the delete failed
+ * invites a retry or an error path. The file simply stays. */
+void bp_tr_dump(const char *path, const char *why);   /* defined below */
+
+int bp_cache_block_delete(const char *path, const char *how) {
+  if (!cache_protected_delete(path)) return 0;
+  static unsigned n;
+  if (n < 20) { n++;
+    tr_log("[cache] BLOCKED %s of %s -- committed entries are read-only "
+                "while offline\n", how, path);
+    bp_tr_dump(path, how); }
+  return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * PER-ENTRY TRACE FOR UnityCache CONTENT
+ *
+ * The verifiers have ruled out the data: stored copies match their files, and
+ * served bytes match the card read for read. So whatever differs when residency
+ * is on, it is not the contents -- which leaves what the descriptor looks like
+ * afterwards, what fstat reports, and the order and shape of the calls.
+ *
+ * Those are observable, so observe them rather than reason about them. Every
+ * operation on a Shared/<name>/<hash>/__data file is counted per entry, and
+ * when something deletes that entry the counters are printed. "Unity opened it
+ * twice, read 64 bytes, never read the rest, then deleted it" is a diagnosis;
+ * "the game evicts entries" is not.
+ *
+ * Counters are cheap. The raw line trace is bounded, because a 30-entry cache
+ * read end to end would otherwise fill the card.
+ * ------------------------------------------------------------------------ */
+/* TRACE LINES NEVER TOUCH THE CARD FROM A READ.
+ *
+ * The first version called debugPrintf() straight from read_fake(). That is the
+ * hottest path in the program, Unity reads bundles on its Background Job
+ * workers, and debugPrintf takes the log lock and blocks on an SD flush. 165
+ * lines in, the watchdog reported the log lock held for over two seconds by
+ * "Background Job.Worker 15" and the process broke.
+ *
+ * util.h has warned about this since before any of my work, PORTING.md records
+ * the parent port hitting it, section 36 records me doing it in the RAM cache
+ * and adding lockcheck.py for it -- and lockcheck passed this build, because the
+ * call is not inside a mutex I take. The hazard was never the mutex. It is doing
+ * blocking I/O on a thread the game needs.
+ *
+ * So lines go into a ring in memory -- a vsnprintf under a lock held for
+ * microseconds, no I/O -- and the frame loop drains them on the main thread,
+ * where a blocking write is already normal. */
+/* SLOT WIDTH IS LOAD-BEARING, and 176 was too narrow.
+ *
+ * vsnprintf() truncates at TRQ_LINE-1 and the '\n' is the LAST byte of every
+ * line here, so an over-long line loses exactly its newline and the next line
+ * drained gets glued onto its tail. debug.log from the last run has nine such
+ * splices and every one is at column 175, which is what makes this a measurement
+ * rather than a suspicion.
+ *
+ * The line it costs most is the eviction dump itself: with a real entry key it
+ * formats to 206 characters, so the "KB from card" and "last offset" fields --
+ * the ones that would say whether Unity ever read the bundle before deleting it
+ * -- were being cut off every time.
+ *
+ * 256 clears the longest line here (the dump, 206) with room to spare. Cost is
+ * 512 * 80 extra bytes = 40 KB of static, against a 2982 MB heap. */
+#define TRQ_MAX  512
+#define TRQ_LINE 256
+static char g_trq[TRQ_MAX][TRQ_LINE];
+static unsigned g_trq_head, g_trq_tail, g_trq_dropped, g_trq_cut;
+static Mutex g_trq_lock;
+
+static void tr_log(const char *fmt, ...) {
+  mutexLock(&g_trq_lock);
+  const unsigned next = (g_trq_tail + 1u) % TRQ_MAX;
+  if (next == g_trq_head) {
+    g_trq_dropped++;                      /* full: drop, never block a reader */
+  } else {
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf(g_trq[g_trq_tail], TRQ_LINE, fmt, ap);
+    va_end(ap);
+    /* Widening the slot is not a guarantee, so make truncation self-reporting
+     * instead of silent: put the newline back and mark the cut. A short line
+     * ending in '~' is obvious; a line with no newline at all is invisible
+     * until you go looking at columns. */
+    if (n >= TRQ_LINE) {
+      g_trq[g_trq_tail][TRQ_LINE - 3] = '~';
+      g_trq[g_trq_tail][TRQ_LINE - 2] = '\n';
+      g_trq[g_trq_tail][TRQ_LINE - 1] = '\0';
+      g_trq_cut++;
+    }
+    g_trq_tail = next;
+  }
+  mutexUnlock(&g_trq_lock);
+}
+
+/* A pre-formatted line from another translation unit. */
+void bp_tr_log_line(const char *line) { tr_log("%s", line); }
+
+/* Called once per frame from bp_boot.c, on the main thread. Bounded per call so
+ * draining a full ring cannot itself become the stall. */
+void bp_tr_flush(void) {
+  for (int i = 0; i < 24; i++) {
+    char line[TRQ_LINE];
+    mutexLock(&g_trq_lock);
+    if (g_trq_head == g_trq_tail) { mutexUnlock(&g_trq_lock); break; }
+    memcpy(line, g_trq[g_trq_head], sizeof line);
+    g_trq_head = (g_trq_head + 1u) % TRQ_MAX;
+    mutexUnlock(&g_trq_lock);
+    /* debugPuts, NOT debugPrintf("%s", line): the format string is what the
+     * importance test reads, so the old call classified every drained line as
+     * the literal "%s" and nothing here could ever force a flush. */
+    debugPuts(line);                       /* outside the lock, on the main thread */
+  }
+  /* Report losses whenever there are any. This used to sit inside the
+   * head==tail branch, so a ring that never fully drained -- which is the state
+   * it is in during exactly the bundle-load burst worth watching -- never
+   * reported a single drop.
+   *
+   * Straight to debugPuts, NOT tr_log: a report that the ring overflowed, queued
+   * into the ring that just overflowed, is the one line guaranteed to be lost.
+   * This runs on the main thread, where a direct log call is already normal. */
+  unsigned dropped, cut;
+  mutexLock(&g_trq_lock);
+  dropped = g_trq_dropped; g_trq_dropped = 0;
+  cut     = g_trq_cut;     g_trq_cut     = 0;
+  mutexUnlock(&g_trq_lock);
+  if (dropped) { char m[96];
+    snprintf(m, sizeof m, "[log] %u trace lines dropped: the ring filled\n", dropped);
+    debugPuts(m); }
+  if (cut) { char m[96];
+    snprintf(m, sizeof m, "[log] %u trace lines were too long for a ring slot\n", cut);
+    debugPuts(m); }
+}
+
+#define TR_MAX 64
+/* One recorded syscall on a cache entry's descriptor. 24 bytes; the buffer is
+ * malloc'd on first use so unopened entries cost nothing. */
+struct TrOp { uint8_t op; uint8_t whence; uint8_t path; int32_t got; int64_t pos; int64_t want; };
+#define TR_OPS 2048
+static struct TrEntry {
+  char key[176];
+  unsigned opens, reads, lseeks, fstats, closes, short_reads;
+  unsigned long long bytes_ram, bytes_card;
+  long last_off, file_size;
+  int resident;
+  struct TrOp *ops; unsigned nops, ops_dropped;
+  unsigned reads_this_open;      /* reset at bind; for the ram_delay_ms experiment */
+} g_tr[TR_MAX];
+static int   g_tr_n;
+static Mutex g_tr_lock;
+static unsigned g_tr_lines;
+
+/* THE SYSCALL SEQUENCE, VERBATIM, FOR THE A/B.
+ *
+ * With ram_cache on, Unity evicts the three bundles whose blocks-info sits at
+ * the END of the file; with it off, it does not. The bytes served are verified
+ * identical to the card, and the one short read is a correct EOF-bounded read
+ * the card would answer the same way. Every path a read/seek/pread can take on
+ * these descriptors has been traced on paper and looks equivalent -- and the
+ * paper has been wrong before. So stop reasoning about the sequence and record
+ * it: every open, read, pread, lseek, fstat and close on the entry, with the
+ * position before, the bytes asked for and the bytes returned. Written out as
+ * ONE block when the descriptor closes, through the lock-free committed writer,
+ * so recording costs nothing during the reads and the block lands whole. Two
+ * runs, one diff, and whatever differs is the answer.
+ *
+ * op: o=open r=read(RAM) R=read(window) C=read(card loop) p=pread s=lseek
+ *     f=fstat c=close   pos=position before   want=bytes asked   got=result */
+static void tr_op(struct TrEntry *e, char op, int64_t pos, int64_t want, int64_t got, int whence, int path) {
+  if (!e || !bp_diag_io) return;                /* heavy: see config.h diag_io */
+  mutexLock(&g_tr_lock);
+  if (!e->ops) e->ops = calloc(TR_OPS, sizeof *e->ops);
+  if (e->ops && e->nops < TR_OPS) {
+    struct TrOp *o = &e->ops[e->nops++];
+    o->op = (uint8_t)op; o->whence = (uint8_t)whence; o->path = (uint8_t)path;
+    o->got = (int32_t)(got > INT32_MAX ? INT32_MAX : got < INT32_MIN ? INT32_MIN : got);
+    o->pos = pos; o->want = want;
+  } else e->ops_dropped++;
+  mutexUnlock(&g_tr_lock);
+}
+static void tr_ops_dump(struct TrEntry *e, int fd) {
+  if (!e || !e->ops || !e->nops || !bp_diag_io) return;
+  extern int iolog_write(const char *s, size_t n);
+  /* HEAP, NOT BSS. The first version of this was a 131 KB static array, and
+   * the first hardware run took a WRITE PERMISSION FAULT 83 KB into it, at a
+   * page boundary, while snprintf was filling it: pc in _dtoa_r, FAR at
+   * out+0x14430, DFSC 0x0f. A page in the middle of this process's bss is
+   * mapped read-only, and nothing in the port asks for that. main.c now walks
+   * the bss at boot and reports any such page; until that says why, no
+   * diagnostic gets a large static buffer. The heap is proven writable. */
+  /* PER CALL, not shared. The first io.log had its first block twice, the
+   * first copy cut mid-line: this buffer was static, formatted under
+   * g_tr_lock and then written OUTSIDE it, so a second close could refill it
+   * while the first write() was still reading it. One buffer per dump. */
+  enum { OUT_CAP = TR_OPS * 64 + 512 };
+  char *out = malloc(OUT_CAP);
+  if (!out) return;
+  size_t n = 0;
+  mutexLock(&g_tr_lock);
+  n += (size_t)snprintf(out + n, OUT_CAP - n,
+                        "=== %s fd=%d open#%u: %u ops%s (size %ld, %s) ===\n",
+                        e->key, fd, e->opens, e->nops,
+                        e->ops_dropped ? " (buffer full, some dropped)" : "",
+                        e->file_size, e->resident ? "RAM" : "card");
+  static const char *WH[] = { "SET", "CUR", "END" };
+  for (unsigned i = 0; i < e->nops && n < OUT_CAP - 96; i++) {
+    const struct TrOp *o = &e->ops[i];
+    switch (o->op) {
+      case 's': n += (size_t)snprintf(out + n, OUT_CAP - n, "%4u s pos=%lld off=%lld %s -> %d\n",
+                                      i, (long long)o->pos, (long long)o->want,
+                                      o->whence < 3 ? WH[o->whence] : "?", o->got); break;
+      case 'p': n += (size_t)snprintf(out + n, OUT_CAP - n, "%4u p off=%lld want=%lld -> %d\n",
+                                      i, (long long)o->pos, (long long)o->want, o->got); break;
+      case 'f': n += (size_t)snprintf(out + n, OUT_CAP - n, "%4u f -> size %d\n", i, o->got); break;
+      case 'o': n += (size_t)snprintf(out + n, OUT_CAP - n, "%4u o flags=0x%llx -> fd %d\n",
+                                      i, (long long)o->want, o->got); break;
+      case 'c': n += (size_t)snprintf(out + n, OUT_CAP - n, "%4u c -> %d\n", i, o->got); break;
+      default:  n += (size_t)snprintf(out + n, OUT_CAP - n, "%4u %c pos=%lld want=%lld -> %d%s\n",
+                                      i, o->op, (long long)o->pos, (long long)o->want, o->got,
+                                      (o->got >= 0 && o->got < o->want) ? "  SHORT" : ""); break;
+    }
+  }
+  e->nops = 0; e->ops_dropped = 0;
+  mutexUnlock(&g_tr_lock);
+  iolog_write(out, n);
+  free(out);
+}
+
+static const char *tr_rel(const char *p) {
+  if (!p) return NULL;
+  const char *r = strstr(p, "/UnityCache/Shared/");
+  if (!r) return NULL;
+  const char *b = strrchr(p, '/');
+  if (!b || strcmp(b, "/__data")) return NULL;     /* content only */
+  return r + strlen("/UnityCache/Shared/");
+}
+
+static struct TrEntry *tr_get(const char *p) {
+  const char *rel = tr_rel(p);
+  if (!rel) return NULL;
+  mutexLock(&g_tr_lock);
+  struct TrEntry *e = NULL;
+  for (int i = 0; i < g_tr_n; i++)
+    if (!strcmp(g_tr[i].key, rel)) { e = &g_tr[i]; break; }
+  if (!e && g_tr_n < TR_MAX) {
+    e = &g_tr[g_tr_n++];
+    memset(e, 0, sizeof *e);
+    snprintf(e->key, sizeof e->key, "%s", rel);
+  }
+  mutexUnlock(&g_tr_lock);
+  return e;
+}
+
+/* fd -> entry, so reads and seeks can be attributed without a path. */
+#define TRF_MAX 96
+static struct { int fd; struct TrEntry *e; } g_trf[TRF_MAX];
+
+static struct TrEntry *tr_by_fd(int fd) {
+  for (int i = 0; i < TRF_MAX; i++)
+    if (g_trf[i].fd == fd + 1) return g_trf[i].e;
+  return NULL;
+}
+static void tr_bind(int fd, struct TrEntry *e) {
+  if (e) e->reads_this_open = 0;
+  if (!e) return;
+  for (int i = 0; i < TRF_MAX; i++)
+    if (!g_trf[i].fd) { g_trf[i].fd = fd + 1; g_trf[i].e = e; return; }
+}
+static void tr_unbind(int fd) {
+  for (int i = 0; i < TRF_MAX; i++)
+    if (g_trf[i].fd == fd + 1) { g_trf[i].fd = 0; g_trf[i].e = NULL; return; }
+}
+
+/* Everything the game did to one entry, printed when it matters.
+ *
+ * Prefix is [evict], not [trace]. Only called on a delete attempt, so it is rare
+ * by construction and can afford a forced flush -- which the ordinary [trace]
+ * open/read/close lines (400+ per run) cannot. Separating them is what lets this
+ * one line reach the card without reinstating the per-line-flush stall. */
+void bp_tr_dump(const char *path, const char *why) {   /* queues; see tr_log */
+  const char *rel = tr_rel(path);
+  if (!rel) {                                   /* maybe a dir or __info: match by prefix */
+    const char *r = path ? strstr(path, "/UnityCache/Shared/") : NULL;
+    if (!r) return;
+    rel = r + strlen("/UnityCache/Shared/");
+  }
+  for (int i = 0; i < g_tr_n; i++) {
+    if (strncmp(g_tr[i].key, rel, strlen(g_tr[i].key) - 7 /* minus "/__data" */) != 0 &&
+        strncmp(rel, g_tr[i].key, strlen(rel)) != 0) continue;
+    const struct TrEntry *e = &g_tr[i];
+    tr_log("[evict] %s (%s): resident=%d size=%ld | opens=%u reads=%u "
+                "short=%u lseeks=%u fstats=%u closes=%u | read %llu KB from RAM, "
+                "%llu KB from card | last offset %ld\n",
+                e->key, why, e->resident, e->file_size, e->opens, e->reads,
+                e->short_reads, e->lseeks, e->fstats, e->closes,
+                e->bytes_ram >> 10, e->bytes_card >> 10, e->last_off);
+    return;
+  }
+  tr_log("[evict] %s (%s): the game never opened it this session\n", rel, why);
+}
+
+/* Key the blob store on a path with any device prefix removed.
+ *
+ * The loader opens files as "sdmc:/switch/battd_nx/..." and the engine opens the
+ * SAME files as "/switch/battd_nx/...". The frozen set was fixed for this two
+ * rounds ago by comparing on the cache-relative part; the BLOB STORE was not,
+ * and it keys on the full path. So the boot loader stored 30 entries under
+ * sdmc:-prefixed names and every engine lookup missed:
+ *
+ *   [ram] boot load: 30 of 30 entries held, 243 of 243 MB
+ *   [ram] served 12 MB from RAM, 896 MB from the card (1% cached)
+ *
+ * 243 MB held and read past. Stripping everything up to the first ':' makes both
+ * spellings identical, and costs one scan of a short string. */
+static const char *fb_key(const char *path) {
+  if (!path) return path;
+  const char *colon = strchr(path, ':');
+  return (colon && colon[1] == '/') ? colon + 1 : path;
+}
+
+static unsigned char *fb_lookup(const char *path, long size) {
+  path = fb_key(path);
+  mutexLock(&g_ram_lock);
+  for (int i = 0; i < g_blob_count; i++)
+    if (!strcmp(g_blob[i].path, path) && g_blob[i].size == size) {
+      unsigned char *hit = g_blob[i].data;
+      mutexUnlock(&g_ram_lock);
+      return hit;
+    }
+  mutexUnlock(&g_ram_lock);
+  return NULL;
+}
+
+/* Runs ONLY on the prefetch thread. */
+/* Absolute-offset read that leaves the descriptor where it found it. */
+static int read_at_fd(int fd, void *buf, size_t n, uint64_t off) {
+  if (fd < 0) return 0;
+  const long cur = lseek(fd, 0, SEEK_CUR);
+  if (lseek(fd, (long)off, SEEK_SET) < 0) return 0;
+  size_t got = 0;
+  while (got < n) {
+    const long k = read(fd, (char *)buf + got, n - got);
+    if (k <= 0) break;
+    got += (size_t)k;
+  }
+  if (cur >= 0) lseek(fd, cur, SEEK_SET);
+  return got == n;
+}
+
+static void fb_load_now_locked(const char *path, long size);
+static void fb_load_now(const char *path, long size) {
+  mutexLock(&g_load_lock);
+  fb_load_now_locked(path, size);
+  mutexUnlock(&g_load_lock);
+}
+static void fb_load_now_locked(const char *path, long size) {
+  if (fb_lookup(path, size)) return;
+  const char *key = fb_key(path);          /* stored form; `path` still opens */
+  mutexLock(&g_ram_lock);
+  const int full = (g_blob_count >= BLOB_MAX || strlen(key) >= sizeof g_blob[0].path);
+  mutexUnlock(&g_ram_lock);
+  if (full) return;
+
+  /* Carve from the image (see g_image). Tentative: g_image_used moves only
+   * when the load and the verify below succeed, so a failed load leaves no
+   * hole and the next file takes the same space. Serialised by g_ram_lock at
+   * commit; only the prefetch thread loads, so the tentative carve is safe. */
+  if (!g_image) return;                         /* no image: everything from the card */
+  mutexLock(&g_ram_lock);
+  const size_t carve_at = g_image_used;
+  const int fits = (size_t)size <= g_image_cap - g_image_used;
+  mutexUnlock(&g_ram_lock);
+  if (!fits) { debugPrintf("[ram] %s: image full (%zu of %zu MB used) -- served from the card\n",
+                           path, g_image_used >> 20, g_image_cap >> 20); return; }
+  unsigned char *data = g_image + carve_at;
+
+  /* Read on a private fd: the caller's is about to be handed to the game with
+   * a position of 0, and seeking it here would be an invisible side effect. */
+  int rfd = open(path, O_RDONLY);
+  int rfd2 = rfd;                      /* same descriptor, used only by the check */
+  long done = 0;
+  if (rfd >= 0) {
+    /* 256 KB at a time, and only while the game is not using the card. A single
+     * 112 MB read here is minutes of device time the game cannot have. */
+    while (done < size) {
+      if (g_pfq_running) pfq_wait_for_quiet();   /* only once the game is live */
+      const size_t want = (size - done) > (256 * 1024) ? (256 * 1024) : (size_t)(size - done);
+      long k = read(rfd, data + done, want);
+      if (k <= 0) break;
+      done += k;
+    }
+  }
+  if (done != size) {
+    if (rfd2 >= 0) close(rfd2);          /* every exit closes it; see below */
+    /* carve not committed: the space is reused by the next file */
+    debugPrintf("[ram] %s: short read (%ld of %ld) -- not made resident\n", path, done, size);
+    return;
+  }
+
+#if BP_RAM_VERIFY
+  /* Compare the whole stored copy against the file before anything can use it.
+   *
+   * This separates two possibilities that the per-read check cannot: a blob
+   * that was loaded wrong, and a blob that is right but served wrong. An A/B
+   * shows the game evicting cache entries with residency on and not with it
+   * off, at a 100% hit rate -- so either these bytes differ from the card or
+   * they do not, and that is worth one extra read of each file to settle.
+   *
+   * A mismatch drops the copy and falls back to the card, so a failure here
+   * costs speed and nothing else. */
+  {
+    const size_t CH = 1u << 20;
+    unsigned char *tmp = malloc(CH);
+    int bad = 0;
+    if (tmp) {
+      long off = 0;
+      while (off < size) {
+        const size_t n = (size_t)(size - off) < CH ? (size_t)(size - off) : CH;
+        if (!read_at_fd(rfd2, tmp, n, (uint64_t)off)) { bad = 1; break; }
+        if (memcmp(tmp, data + off, n) != 0) {
+          size_t k = 0;
+          while (k < n && tmp[k] == data[off + k]) k++;
+          debugPrintf("[ram] VERIFY FAILED loading %s at +%ld: stored %02x, file %02x\n",
+                      path, off + (long)k, data[off + k], tmp[k]);
+          bad = 1;
+          break;
+        }
+        off += (long)n;
+      }
+      free(tmp);
+    }
+    if (bad) {
+      /* Moving close() to the end of the function last round left it unreachable
+       * from the two early returns. Twenty-seven files per boot, and a descriptor
+       * leaked on each failure -- which on a handle-limited filesystem is how a
+       * later open starts failing for no visible reason. */
+      if (rfd2 >= 0) close(rfd2);
+      /* carve not committed */
+      debugPrintf("[ram] %s REJECTED -- the stored copy does not match the file\n", path);
+      return;
+    }
+  }
+#endif
+
+  /* THE SUCCESS PATH HAD NO close() AT ALL.
+   *
+   * The original closed this descriptor straight after the read loop. Adding
+   * the load-time verification meant holding it a little longer, so the close
+   * moved -- to a place that did not survive the edit. Every file that loaded
+   * cleanly leaked its descriptor: twenty-seven per boot, and only with the
+   * cache on. fsdev's handle table is not large, and a shim that quietly eats
+   * handles makes some later open() fail for no reason visible where it fails.
+   *
+   * Found by re-reading my own patch, not by a test: no host harness models a
+   * handle limit, and the checkers look at declarations, not resource
+   * lifetimes. */
+  if (rfd2 >= 0) close(rfd2);
+
+  mutexLock(&g_ram_lock);
+  int n = 0; long held = 0;
+  if (g_blob_count < BLOB_MAX && data == g_image + g_image_used) {   /* still ours: commit */
+    g_image_used += (size_t)size;
+    snprintf(g_blob[g_blob_count].path, sizeof g_blob[0].path, "%s", key);
+    g_blob[g_blob_count].data = data;
+    g_blob[g_blob_count].size = size;
+    /* Reference copy of the head, and a checksum of the whole thing, for the
+     * per-frame integrity scan (see blob_scan). */
+    memcpy(g_blob[g_blob_count].head, data, size < (long)BLOB_HEAD ? (size_t)size : BLOB_HEAD);
+    g_blob[g_blob_count].crc = blob_crc(data, (size_t)size);
+    g_blob[g_blob_count].bad = 0;
+    g_blob_count++;
+    n = g_blob_count;
+    held = (((long)bp_ram_cache_mb << 20) - g_ram_budget) >> 20;
+  }
+  mutexUnlock(&g_ram_lock);
+  /* LOG AFTER UNLOCKING. debugPrintf takes the log lock and can block on an SD
+   * flush; holding a cache lock across that is what deadlocked the port. */
+  /* One line per file was 27 blocking SD writes during the busiest part of the
+   * boot. A count and a total say the same thing. */
+  if (n && (n == 1 || n % 8 == 0))
+    debugPrintf("[ram] %d files held, %ld MB\n", n, held);
+}
 static Mutex g_ra_lock;
 static struct RaCache *ra_find(int fd) {
   if (fd < 0) return NULL;
-  for (int i = 0; i < RA_SLOTS; i++) if (g_ra[i].fd == fd) return &g_ra[i];
+  for (int i = 0; i < RA_SLOTS; i++) if (g_ra[i].used && g_ra[i].fd == fd) return &g_ra[i];
   return NULL;
 }
-void ra_attach(int fd, long size) {
+/* Worth holding in RAM? Two separate cases, and they need different rules.
+ *
+ *  - Anything under files/UnityCache/: the downloaded AssetBundles. Unity opens
+ *    and closes these constantly, and TWO THIRDS OF THEM ARE UNDER 4 MB -- 20 of
+ *    the 30 this game caches. Judging them by size would have skipped most of
+ *    the set to save 19 MB, which is the wrong trade when the budget is 512 MB.
+ *    Size is irrelevant here; how often the file is reopened is the point.
+ *
+ *  - Any other read-only file of 4 MB or more. That is the original rule, kept
+ *    for data.unity3d and the sharedassets resources.
+ *
+ * Everything else is left alone: a 1 MB read-ahead window around a 25 KB file
+ * costs more than it saves. */
+/* 0 = leave it alone, 1 = read-ahead window only, 2 = hold the whole file.
+ *
+ * NOTHING UNDER UnityCache IS HELD ANY MORE, and that is a retreat, not a
+ * refinement. Three attempts at scoping it all failed on hardware:
+ *
+ *   1. "anything under /UnityCache/"  -- also caught __info, Unity's own
+ *      bookkeeping, which it rewrites constantly. It read back its own writes
+ *      as the copy from before them and stopped trusting committed entries.
+ *   2. "...but only __data"           -- also caught UnityCache/Temp/, the
+ *      download staging file. A snapshot taken mid-download failed every CRC
+ *      check, so nothing could be re-fetched either.
+ *   3. "...but only Shared/__data"    -- Unity writes committed entries in
+ *      place as well. A bundle snapshotted while it was still being written
+ *      loaded as "File may be corrupted".
+ *
+ * Each fix was narrower than the last and each still broke the game, because
+ * the premise was wrong: residency assumes an immutable file, and NOTHING in
+ * UnityCache is immutable from this port's side. There is no path test that
+ * distinguishes "finished" from "being written", and between them these bugs
+ * cost a user their entire 244 MB cache.
+ *
+ * UnityCache now gets the 1 MB read-ahead window instead, which is what it had
+ * before any of this and which does not copy the file. The window is also a
+ * genuine improvement now -- it never attached at all until the `used` flag was
+ * fixed (see the RaCache comment above).
+ *
+ * The asset pack keeps full residency, in asset_pack.c: it is a file this port
+ * builds and the game never writes, which is exactly the property UnityCache
+ * lacks. */
+/* ---------------------------------------------------------------------------
+ * UnityCache residency, safely: freeze the eligible set BEFORE the engine runs.
+ *
+ * Three earlier attempts scoped this by path and all three broke the game,
+ * because no path test separates "finished" from "being written". The property
+ * that actually matters is not WHERE a file is but WHEN it was finished.
+ *
+ * Shared/<id>/<hash>/__data is content-addressed: change the content and the
+ * hash changes, so it is a different path. A file that was already complete
+ * before the engine started therefore cannot be rewritten in place -- Unity
+ * creates a new hash directory instead. Freeze that set at boot and only those
+ * paths are ever held, which closes all three failures by construction:
+ *
+ *   __info          never listed (we only record __data)
+ *   Temp/           not under Shared/, never listed
+ *   mid-write       created during the session, so not in the boot list
+ *
+ * The remaining routes by which a frozen path's bytes could change are all
+ * intercepted, and each drops the copy: open-for-write, rename onto it, and
+ * truncate. remove/unlink need no hook -- a replacement file has to be opened
+ * for writing before it has any content. */
+#define FROZEN_MAX 256
+static char g_frozen[FROZEN_MAX][192];
+static int  g_frozen_count;
+static int  g_frozen_done;
+
+/* Compare on the cache-relative part, not the whole path.
+ *
+ * The loader opens files as "sdmc:/switch/battd_nx/..." and the engine opens the
+ * SAME files as "/switch/battd_nx/...". A full-path compare therefore never
+ * matched: three consecutive boots froze 30 entries as eligible and held none of
+ * them, and the only clue was a [ram] line for global-metadata.dat -- which
+ * qualifies under the size rule, not the frozen set -- carrying the prefix-less
+ * form while the freeze had logged the prefixed one. */
+static const char *cache_rel(const char *p) {
+  return p ? strstr(p, "/UnityCache/Shared/") : NULL;
+}
+
+/* Re-stat everything that was complete at boot, and report anything that has
+ * since gone.
+ *
+ * The unlink/remove/unlinkat hooks only catch deletion through those calls. An
+ * entry has vanished between launches with none of them firing, so either it
+ * went by a route this shim does not wrap, or it went while an older build was
+ * running. Watching the files themselves closes that: whatever removes them,
+ * this notices, and the line lands next to whatever the game was doing.
+ *
+ * Only stats -- 30 stat() calls a minute, and only of paths already known. */
+void bp_ram_check_frozen(void);
+/* Set when something is deleted under UnityCache, so the next frame checks the
+ * frozen set immediately instead of waiting for the next poll. The interesting
+ * moment is exactly then. */
+volatile int g_cache_recheck;
+
+void bp_ram_check_frozen(void) {
+  static uint64_t next_ns;
+  const uint64_t now = armTicksToNs(armGetSystemTick());
+  if (now < next_ns && !g_cache_recheck) return;
+  g_cache_recheck = 0;
+  /* Every 5 seconds, not every 60. The run that prompted this lasted NINE
+   * seconds, so a once-a-minute poll never fired and the log said nothing at
+   * all about files that were gone by the end of it. A poll that cannot
+   * complete a cycle inside a typical session is not an instrument. */
+  next_ns = now + 5ull * 1000000000ull;
+  if (!g_frozen_done) return;
+  for (int i = 0; i < g_frozen_count; i++) {
+    if (!g_frozen[i][0]) continue;                /* already reported */
+    char full[900];
+    snprintf(full, sizeof full, "%s/files/UnityCache/Shared%s",
+             bp_game_root(), g_frozen[i] + strlen("/UnityCache/Shared"));
+    struct stat st;
+    if (stat(full, &st) == 0 && st.st_size > 0) continue;
+    debugPrintf("[cache] VANISHED: %s was present at boot and is now gone "
+                "(nothing called unlink/remove for it)\n", g_frozen[i]);
+    g_frozen[i][0] = 0;                           /* report once */
+  }
+}
+
+/* Load EVERY eligible cache entry now, before the engine starts.
+ *
+ * The measurement that forced this: the game read 3,149 MB from the card over a
+ * 243 MB cache -- every bundle about thirteen times -- and the cache served 2%
+ * of it. Loading on second open, throttled to leave the card free, meant the
+ * prefetch never ran: the game reads continuously, so the 250 ms idle gap it
+ * waited for never arrived. It held 205 MB and bought almost nothing.
+ *
+ * Front-loading fixes both halves. The reads happen once, at boot, where a wait
+ * is expected and can be shown on screen -- instead of competing with the game
+ * for the card during play, which is what the stalls were. After that the 3 GB
+ * of repeat reads come out of memory.
+ *
+ * Budget exhaustion is not an error: whatever fits is held, the rest is read
+ * from the card as before, and the log says which. */
+void bp_ram_load_all(void) {
+  if (bp_ram_cache_mb <= 0 || !g_frozen_done || g_frozen_count == 0) return;
+  extern void startup_status_begin(const char *msg);
+  extern void startup_status_update(const char *msg);
+  extern void startup_status_end(void);
+
+  long total = 0, done_bytes = 0;
+  struct stat st;
+  char full[900];
+  for (int i = 0; i < g_frozen_count; i++) {
+    snprintf(full, sizeof full, "%s/files/UnityCache/Shared%s",
+             bp_game_root(), g_frozen[i] + strlen("/UnityCache/Shared"));
+    if (stat(full, &st) == 0 && st.st_size > 0) total += (long)st.st_size;
+  }
+  if (total <= 0) return;
+
+  char msg[160];
+  snprintf(msg, sizeof msg, "Loading game content into memory (%ld MB)", total >> 20);
+  startup_status_begin(msg);
+
+  int held = 0;
+  for (int i = 0; i < g_frozen_count; i++) {
+    snprintf(full, sizeof full, "%s/files/UnityCache/Shared%s",
+             bp_game_root(), g_frozen[i] + strlen("/UnityCache/Shared"));
+    if (stat(full, &st) != 0 || st.st_size <= 0) continue;
+    fb_load_now(full, (long)st.st_size);
+    if (fb_lookup(full, (long)st.st_size)) { held++; done_bytes += (long)st.st_size; }
+    snprintf(msg, sizeof msg, "Loading game content into memory (%ld of %ld MB)",
+             done_bytes >> 20, total >> 20);
+    startup_status_update(msg);
+  }
+  startup_status_end();
+  debugPrintf("[ram] boot load: %d of %d entries held, %ld of %ld MB "
+              "(anything that did not fit is read from the card)\n",
+              held, g_frozen_count, done_bytes >> 20, total >> 20);
+}
+
+static int frozen_eligible(const char *path) {
+  if (!g_frozen_done) return 0;
+  const char *rel = cache_rel(path);
+  if (!rel) return 0;
+  for (int i = 0; i < g_frozen_count; i++)
+    if (!strcmp(g_frozen[i], rel)) return 1;
+  return 0;
+}
+
+/* Call once at boot, before the engine touches anything. */
+/* Same depth-agnostic walk as the census: an entry is any directory holding a
+ * non-empty __data with an __info beside it, however deep. Unity names entries
+ * after the URL, so a bundle fetched from ".../talkingheads/audio" lands three
+ * levels down, and a two-level walk never saw it. */
+/* LEAVE BLOCKS-INFO-AT-END BUNDLES ON THE CARD.
+ *
+ * Of the thirty cached bundles, twenty-seven carry their blocks-info at the
+ * start of the file (UnityFS flags 0x243) and three carry it at the END
+ * (flags 0xc0). Every run with the RAM cache on, Unity rejects exactly those
+ * three -- reads the header, the directory from the tail, the first block,
+ * closes, and asks to re-download -- and never any of the other twenty-seven.
+ * With the cache off it loads all thirty. The syscall sequences on those
+ * descriptors are identical between the two paths for 293 operations, the
+ * bytes served are verified, and the divergence is Unity's decision after
+ * block 0; what differs in the RAM path for THAT loader shape is still not
+ * understood.
+ *
+ * So: don't argue with it. Read the header at freeze time and keep any bundle
+ * whose blocks-info is at the end out of the resident set. It is served from
+ * the card through the read-ahead window like the cache-off case, which is
+ * known to work, and the other twenty-seven keep the 100% RAM hit rate. A
+ * rule on the header flag rather than three hashes survives a game update. */
+static int blocks_info_at_end(const char *data_path) {
+  unsigned char h[64];
+  const int fd = open(data_path, O_RDONLY);
+  if (fd < 0) return 0;
+  const long n = read(fd, h, sizeof h);
+  close(fd);
+  if (n < 24 || memcmp(h, "UnityFS", 7) != 0) return 0;
+  /* sig\0, u32 version, then two NUL-terminated strings, then u64 size,
+   * u32 compressedBlocksInfoSize, u32 uncompressedBlocksInfoSize, u32 flags */
+  long i = 8 + 4;
+  while (i < n && h[i]) i++;                         /* unityVersion ... */
+  i++;                                               /* ... and its NUL */
+  while (i < n && h[i]) i++;                         /* generatorVersion ... */
+  i++;
+  i += 8 + 4 + 4;                                    /* size, cbi, ubi */
+  if (i + 4 > n) return 0;
+  const uint32_t flags = ((uint32_t)h[i] << 24) | ((uint32_t)h[i+1] << 16) |
+                         ((uint32_t)h[i+2] << 8) | (uint32_t)h[i+3];
+  return (flags & 0x80) != 0;
+}
+
+static void freeze_walk(const char *dir, int depth, long *bytes) {
+  if (depth > 6 || g_frozen_count >= FROZEN_MAX) return;
+  char data[1400], info[1400];
+  struct stat st, si;
+  snprintf(data, sizeof data, "%s/__data", dir);
+  snprintf(info, sizeof info, "%s/__info", dir);
+  if (stat(data, &st) == 0 && st.st_size > 0 && stat(info, &si) == 0) {
+    const char *rel = cache_rel(data);
+    if (rel && strlen(rel) < sizeof g_frozen[0]) {
+      if (bp_ram_max_file_mb > 0 && st.st_size > (off_t)bp_ram_max_file_mb * 1024 * 1024) {
+        debugPrintf("[ram] %s stays on the card: %ld MB is over ram_max_file_mb=%d (loaded once, "
+                    "behind a loading screen)\n", rel, (long)(st.st_size >> 20), bp_ram_max_file_mb);
+      } else if (bp_ram_skip_tail && blocks_info_at_end(data)) {
+        debugPrintf("[ram] %s stays on the card: blocks-info at end of file (the shape Unity "
+                    "rejects when served from RAM)\n", rel);
+      } else {
+        snprintf(g_frozen[g_frozen_count], sizeof g_frozen[0], "%s", rel);
+        g_frozen_count++;
+        *bytes += st.st_size;
+      }
+    }
+    return;                                  /* an entry is a leaf */
+  }
+  DIR *d = opendir(dir);
+  if (!d) return;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL) {
+    if (e->d_name[0] == '.') continue;
+    char sub[1200];
+    snprintf(sub, sizeof sub, "%s/%s", dir, e->d_name);
+    struct stat sd;
+    if (stat(sub, &sd) != 0 || !S_ISDIR(sd.st_mode)) continue;
+    freeze_walk(sub, depth + 1, bytes);
+  }
+  closedir(d);
+}
+
+void bp_ram_freeze_cache_set(const char *root) {
+  char shared[700];
+  snprintf(shared, sizeof shared, "%s/files/UnityCache/Shared", root);
+  g_frozen_done = 1;
+  struct stat st;
+  if (stat(shared, &st) != 0) {
+    debugPrintf("[ram] no UnityCache yet: nothing frozen for residency\n");
+    return;
+  }
+  long bytes = 0;
+  freeze_walk(shared, 0, &bytes);
+  debugPrintf("[ram] froze %d complete cache entries (%ld MB) as eligible for "
+              "residency; anything written this session is not\n",
+              g_frozen_count, bytes >> 20);
+  /* The image: sized to the frozen set, taken from the budget once. If the
+   * budget will not cover it, residency is off for the session and every
+   * entry is served from the card -- "no faster", never "wrong". */
+  if (bytes > 0 && !g_image) {
+    if (bp_ram_cache_take(bytes) == bytes) {
+      g_image = malloc((size_t)bytes);
+      if (g_image) { g_image_cap = (size_t)bytes; g_image_used = 0;
+        debugPrintf("[ram] resident image: %ld MB in one allocation at %p, never freed\n",
+                    bytes >> 20, (void *)g_image); }
+      else { bp_ram_cache_give(bytes);
+        debugPrintf("[ram] resident image: malloc(%ld MB) FAILED -- everything served from the card\n", bytes >> 20); }
+    } else debugPrintf("[ram] resident image: budget will not cover %ld MB -- everything served from the card\n", bytes >> 20);
+  }
+}
+
+static int residency_mode(const char *path, long size) {
+  if (size <= 0 || !path) return 0;
+
+  /* ram_cache = 0 means OFF, and off has to mean the behaviour this port had
+   * before any of this existed -- no residency AND no read-ahead window.
+   *
+   * That distinction matters. The window looks like it predates the cache, but
+   * it never actually ran: ra_attach() searched for a free slot with `fd < 0`
+   * while static storage zero-initialises fd to 0, so it attached to nothing
+   * for the whole life of the project. Fixing that in the same change that
+   * added residency switched the window on for the first time too. Leaving it
+   * enabled at ram_cache = 0 would offer an "off" switch that still changes
+   * how every file over 4 MB is read. */
+  if (bp_ram_cache_mb <= 0) return 0;
+
+  /* Only entries that were already complete at boot. Never the 1 MB window
+   * either: it has the same staleness problem in 1 MB pieces, and it had never
+   * actually attached to anything until the `used` flag was fixed, so letting it
+   * cover files the game writes would be a new hazard, not an old one. */
+  if (strstr(path, "/UnityCache/")) return frozen_eligible(path) ? 2 : 0;
+
+  /* The loader's own modules are read once by so_util and then mapped; holding
+   * them cost 68 MB that nothing read again. */
+  const size_t n = strlen(path);
+  if (n > 3 && !strcmp(path + n - 3, ".so")) return 0;
+
+  /* global-metadata.dat for the same reason, and more carefully: il2cpp reads
+   * it once at startup, dup()s the descriptor and hands it to
+   * MemoryMappedFile::Map, which this port's mmap shim satisfies by reading the
+   * file into RAM anyway. Holding it duplicates 7 MB that is never read again
+   * AND puts the residency path -- with its dup handling and its position
+   * bookkeeping -- on the single most critical file in the process, for no
+   * gain. It was one of only two things the cache held during the boots being
+   * investigated; the other, the pack, verifies itself. */
+  if (strstr(path, "global-metadata.dat")) return 0;
+
+  /* Big, read-only, staged by the user and never written by the game:
+   * data.unity3d, the sharedassets resources, global-metadata.dat. */
+  return size >= (4 << 20) ? 2 : 0;
+}
+
+/* Stop virtualising one descriptor, leaving the real one where the reader
+ * believes it is.
+ *
+ * Needed because dup() hands out a SECOND descriptor that shares the SAME file
+ * offset, while only the original carries a cache slot. Reads through the
+ * original are answered from RAM and never move the real offset, so the
+ * duplicate reads from wherever the file was opened -- offset 0. Unity dup()s
+ * a bundle it is verifying, and got "CRC Mismatch ... calculated 0 from data".
+ *
+ * Trying to keep both descriptors cached is not an option: POSIX says they
+ * share one offset, and two cache slots would track two independent positions.
+ * So the cache loses this file for the rest of the session, which is the
+ * correct trade -- a cache that changes behaviour is not a cache. */
+/* Forget everything we hold about one descriptor's file, by fd.
+ *
+ * fb_invalidate() works on a path, which is what open-for-write and rename give
+ * us. ftruncate only gives an fd, so this finds the slot, frees the blob it
+ * borrows, and detaches. Without it a truncate would leave a resident copy of
+ * the file as it was before -- and ftruncate here is a real truncate, not the
+ * no-op its "_stub" name suggests. */
+void bp_ra_forget_fd(int fd) {
+  mutexLock(&g_ram_lock);
   mutexLock(&g_ra_lock);
-  for (int i = 0; i < RA_SLOTS; i++) if (g_ra[i].fd < 0) {
-    if (!g_ra[i].buf) g_ra[i].buf = malloc(RA_WIN);
-    if (g_ra[i].buf) { g_ra[i].fd = fd; g_ra[i].pos = 0; g_ra[i].size = size; g_ra[i].base = 0; g_ra[i].len = 0; }
+  for (int i = 0; i < RA_SLOTS; i++) {
+    if (!g_ra[i].used || g_ra[i].fd != fd) continue;
+    if (g_ra[i].resident && g_ra[i].buf) {
+      for (int b = 0; b < g_blob_count; b++)
+        if (g_blob[b].data == g_ra[i].buf) {
+          /* image: drop the entry, the bytes stay, the budget was taken once */
+          g_blob[b] = g_blob[--g_blob_count];
+          break;
+        }
+    }
+    g_ra[i].used = 0; g_ra[i].buf = NULL; g_ra[i].resident = 0;
+    break;
+  }
+  mutexUnlock(&g_ra_lock);
+  mutexUnlock(&g_ram_lock);
+}
+
+void bp_ra_devirtualise(int fd) {
+  int hit = 0;
+  mutexLock(&g_ra_lock);
+  struct RaCache *c = NULL;
+  for (int i = 0; i < RA_SLOTS; i++)
+    if (g_ra[i].used && g_ra[i].fd == fd) { c = &g_ra[i]; break; }
+  if (c) {
+    lseek(fd, c->pos, SEEK_SET);        /* put the real fd where the reader is */
+    c->used = 0;
+    if (c->resident) { c->buf = NULL; c->resident = 0; }
+    hit = 1;
+  }
+  mutexUnlock(&g_ra_lock);
+  if (hit) tr_log("[ram] fd %d is being duplicated -- serving it from the "
+                       "card from here on, so both descriptors share one "
+                       "position\n", fd);
+}
+
+/* Give every held file back to the allocator.
+ *
+ * A cache must yield to real demand, and this one did not. On the character
+ * screen the game asked newlib for a single 128 MB block and was refused while
+ * 377 MB sat here -- 294 MB of bundles plus the 83 MB pack -- much of it in
+ * awkward sizes (one blob is 112 MB) that fragment the heap as well as consume
+ * it. The allocation failed, and the port broke into the debugger.
+ *
+ * Resident RaCache slots are detached first, and each real fd is seeked to the
+ * position its resident slot had reached, so reads continue correctly from the
+ * file instead of resuming at whatever offset the descriptor was left at. That
+ * matters: the resident path tracks position virtually and never moves the real
+ * descriptor.
+ *
+ * Locks are taken ram-then-ra, matching ra_attach_path's order (it calls
+ * fb_resident, which takes the ram lock, before taking the ra lock). Taking
+ * them the other way round here would be a lock-order inversion. */
+long bp_ram_cache_release_all(void) {
+  mutexLock(&g_ram_lock);
+  mutexLock(&g_ra_lock);
+  for (int i = 0; i < RA_SLOTS; i++)
+    if (g_ra[i].used && g_ra[i].resident) {
+      lseek(g_ra[i].fd, g_ra[i].pos, SEEK_SET);   /* sync the descriptor */
+      g_ra[i].used = 0;
+      g_ra[i].buf = NULL;
+      g_ra[i].resident = 0;
+    }
+  long freed = 0;
+  /* image: every slot is detached above, so the one allocation can go back
+   * whole. Future opens are served from the card. */
+  if (g_image) { freed = (long)g_image_cap; free(g_image); g_image = NULL; g_image_cap = g_image_used = 0; }
+  g_blob_count = 0;
+  g_ram_budget += freed;
+  mutexUnlock(&g_ra_lock);
+  mutexUnlock(&g_ram_lock);
+  if (freed)
+    debugPrintf("[ram] released %ld MB back to the allocator under memory pressure; "
+                "files are read from the card from here on\n", freed >> 20);
+  return freed;
+}
+
+/* Any write to a path drops its resident copy, so the next reader sees the file
+ * rather than a snapshot of it. residency_mode() already keeps written files
+ * out; this is the backstop for a path this port has not thought of. */
+void bp_ram_forget_path(const char *path);
+static void fb_invalidate(const char *path) {
+  if (!path) return;
+  const char *key = fb_key(path);
+  int dropped = 0;
+  mutexLock(&g_ram_lock);
+  for (int i = 0; i < g_blob_count; i++)
+    if (!strcmp(g_blob[i].path, key)) {
+      dropped = 1;
+      const long freed = g_blob[i].size;
+      /* Detach every slot still borrowing this blob BEFORE freeing it.
+       *
+       * Without this the free leaves any resident slot pointing at released
+       * memory, and the next read through that descriptor is a use-after-free
+       * that returns whatever the allocator has since put there -- plausible
+       * bytes, no fault, and a bundle that Unity rejects seconds later. Unity
+       * opens a cached bundle for reading and then opens the same path for
+       * writing when it decides to replace it, which is exactly this sequence.
+       * Each descriptor is seeked to where its reader believes it is, so it
+       * carries on correctly straight from the file. */
+      mutexLock(&g_ra_lock);
+      for (int r = 0; r < RA_SLOTS; r++)
+        if (g_ra[r].used && g_ra[r].resident && g_ra[r].buf == g_blob[i].data) {
+          lseek(g_ra[r].fd, g_ra[r].pos, SEEK_SET);
+          g_ra[r].used = 0; g_ra[r].buf = NULL;
+          g_ra[r].resident = 0; g_ra[r].blobpath = NULL;
+        }
+      mutexUnlock(&g_ra_lock);
+      /* image: the bytes stay where they are and the budget was taken once
+       * for the whole image; a dropped file is served from the card from now
+       * on (its space is not reused -- "no faster", never "wrong"). */
+      g_blob[i] = g_blob[--g_blob_count];
+      (void)freed;                /* was: g_ram_budget += freed -- the note below explained why it
+                                   * mattered for per-file blobs; it does not apply to an image.
+                                   * budget, so a file invalidated and re-read a
+                                   * few times would exhaust it and silently stop
+                                   * anything else becoming resident. Done inline
+                                   * because the lock is already held. */
+      break;
+    }
+  mutexUnlock(&g_ram_lock);
+}
+
+/* pread bypasses the cache and the read counters; imports.c reports it here so
+ * the op log sees it. */
+void bp_tr_note_pread(int fd, long off, size_t n, long got) {
+  struct TrEntry *te = tr_by_fd(fd);
+  if (te) { te->bytes_card += got > 0 ? (unsigned long long)got : 0; tr_op(te, 'p', off, (int64_t)n, got, 0, 2); }
+}
+
+/* Same thing under a name other translation units can reach. imports.c needs it
+ * for unlink/remove, which change a path's contents with no open-for-write for
+ * fb_invalidate's usual callers to see. */
+void bp_ram_forget_path(const char *path) { fb_invalidate(path); }
+
+void ra_attach_path(int fd, long size, const char *path) {
+  unsigned char *blob = path ? fb_resident(path, size) : NULL;
+  mutexLock(&g_ra_lock);
+  for (int i = 0; i < RA_SLOTS; i++) if (!g_ra[i].used) {
+    if (blob) {
+      g_ra[i].fd = fd; g_ra[i].pos = 0; g_ra[i].size = size;
+      g_ra[i].base = 0; g_ra[i].len = size;
+      g_ra[i].buf = blob; g_ra[i].resident = 1; g_ra[i].used = 1;
+      g_ra[i].blobpath = fb_path_of(blob);
+    } else {
+      if (size < (4 << 20)) break;   /* too small for a window to pay for itself */
+      if (!g_ra[i].buf || g_ra[i].resident) { g_ra[i].buf = malloc(RA_WIN); g_ra[i].resident = 0; }
+      if (g_ra[i].buf) {
+        g_ra[i].fd = fd; g_ra[i].pos = 0; g_ra[i].size = size;
+        g_ra[i].base = 0; g_ra[i].len = 0; g_ra[i].resident = 0; g_ra[i].used = 1;
+        g_ra[i].blobpath = NULL;
+      }
+    }
     break;
   }
   mutexUnlock(&g_ra_lock);
 }
+
+/* Kept for callers that have no path to offer. Defined AFTER ra_attach_path
+ * because C needs the declaration first, and this file has no header. */
+void ra_attach(int fd, long size) { ra_attach_path(fd, size, NULL); }
+
 void ra_detach(int fd) {
   mutexLock(&g_ra_lock);
   struct RaCache *c = ra_find(fd);
-  if (c) c->fd = -1;   /* keep buf allocated for reuse */
+  if (c) {
+    c->used = 0;             /* window buffers stay allocated for reuse */
+    c->fd = -1;
+    if (c->resident) { c->buf = NULL; c->resident = 0; }   /* blob is borrowed */
+  }
   mutexUnlock(&g_ra_lock);
 }
+/* THE REAL DESCRIPTOR OWNS THE POSITION. The cache holds DATA, nothing else.
+ *
+ * This layer used to keep a virtual position and leave the real fd wherever it
+ * was opened. That is correct only if every route to the file goes through
+ * read_fake and z_lseek -- and three separate routes did not, each found only
+ * after it corrupted something on hardware: the `used` flag (the cache never
+ * attached at all), __read_chk (the fortified read bionic libraries actually
+ * call), and dup (a second descriptor sharing one offset). fdopen and ftruncate
+ * were two more waiting their turn.
+ *
+ * Enumerating doors was the wrong strategy: nothing makes the list complete, and
+ * the compiler cannot point at the missing ones. So the position is no longer
+ * virtual. Every cached read reads the real position first and writes it back
+ * after, which costs two cheap lseeks and no data transfer, and makes every
+ * bypass -- present or future, ours or newlib's -- correct by construction. */
 static long ra_read(struct RaCache *c, int fd, void *buf, size_t count) {
   size_t done = 0;
+  const long real = lseek(fd, 0, SEEK_CUR);
+  if (real < 0) return read(fd, buf, count);   /* cannot sync: do not serve */
   mutexLock(&g_ra_lock);
+  c->pos = real;
   while (done < count) {
     if (c->len == 0 || c->pos < c->base || c->pos >= c->base + c->len) {
+      /* A resident slot holds the whole file; reaching here means EOF. A refill
+       * would read() into the shared blob, and there is nothing to fetch: stop. */
+      if (c->resident) break;
       if (lseek(fd, c->pos, SEEK_SET) < 0) break;
       long r = 0;
       while (r < (long)RA_WIN) { long k = read(fd, c->buf + r, RA_WIN - r); if (k <= 0) break; r += k; }
@@ -522,8 +1948,48 @@ static long ra_read(struct RaCache *c, int fd, void *buf, size_t count) {
     size_t n = (count - done < (size_t)avail) ? count - done : (size_t)avail;
     memcpy((char *)buf + done, c->buf + (c->pos - c->base), n);
     c->pos += n; done += n;
+    if (c->resident) g_bytes_from_ram += n; else g_bytes_from_card += n;
   }
+  const long endpos = c->pos;
+  const int was_resident = c->resident;
+  const char *who = c->blobpath;
   mutexUnlock(&g_ra_lock);
+
+#if BP_RAM_VERIFY_READS
+  /* Compare what we just handed back against the same range of the real file.
+   * A wrong cached read does not fault -- it returns plausible bytes, and the
+   * first sign is Unity rejecting a bundle seconds later. This turns that into
+   * an exact report. Bounded in both size and count so an early systematic
+   * failure does not fill the card. */
+  if (done && was_resident) {
+    static unsigned reported;
+    static unsigned char probe[64 * 1024];
+    const size_t n = done < sizeof probe ? done : sizeof probe;
+    if (lseek(fd, real, SEEK_SET) == real) {
+      size_t got = 0;
+      while (got < n) {
+        const long k = read(fd, probe + got, n - got);
+        if (k <= 0) break;
+        got += (size_t)k;
+      }
+      if (got != n || memcmp(probe, buf, n) != 0) {
+        if (reported < 8) {
+          reported++;
+          size_t at = 0;
+          while (at < got && at < n && probe[at] == ((const unsigned char *)buf)[at]) at++;
+          tr_log("[ram] VERIFY FAILED fd=%d %s off=%ld len=%zu: file gave %zu bytes, "
+                      "first difference at +%zu (cache %02x, file %02x)\n",
+                      fd, who ? who : "(unknown)", real, done, got, at,
+                      at < n ? ((const unsigned char *)buf)[at] : 0,
+                      at < got ? probe[at] : 0);
+        }
+      }
+    }
+  }
+#endif
+
+  if (done) lseek(fd, endpos, SEEK_SET);       /* leave the real fd where a
+                                                * bypassing reader expects it */
   return (long)done;
 }
 
@@ -536,14 +2002,33 @@ long z_lseek(int fd, long off, int whence) {
    * so they must be answered before ra_find() looks them up. */
   if (asset_pack_fd_is(fd)) return asset_pack_lseek_fd(fd, off, whence);
   struct RaCache *c = ra_find(fd);
-  if (c) {   /* virtualized position -- don't touch the real fd here */
-    mutexLock(&g_ra_lock);
-    long np = (whence == SEEK_SET) ? off : (whence == SEEK_CUR) ? c->pos + off : c->size + off;
-    c->pos = np;
-    mutexUnlock(&g_ra_lock);
+  if (c) {
+    /* Seek the REAL descriptor and mirror the answer, rather than tracking a
+     * position only this layer knows about. A dup'd or fdopen'd view of the
+     * same file then sees the same offset, which is the whole point. */
+    const long np = lseek(fd, off, whence);
+    if (np >= 0) { mutexLock(&g_ra_lock); c->pos = np; mutexUnlock(&g_ra_lock); }
+    /* The [evict] counters said lseeks=0 for every evicted entry. That was
+     * this function not counting, not Unity not seeking -- the trace showed
+     * pos going 64 -> 12 with no seek recorded. SEEK_END is how the engine
+     * sizes a bundle before deciding whether it is whole, so that one gets a
+     * line: if the answer ever disagrees with the entry's size, that is the
+     * eviction. */
+    { struct TrEntry *te = tr_by_fd(fd);
+      if (te) {
+        te->lseeks++;
+        tr_op(te, 's', c->pos, off, np, whence, 1);
+        if (whence == SEEK_END)
+          tr_log("[evict] SEEK_END %s fd=%d -> %ld (entry size %ld)%s\n",
+                 te->key, fd, np, (long)c->size,
+                 np == (long)c->size ? "" : "  *** DISAGREES ***");
+      } }
     return np;
   }
-  return lseek(fd, off, whence);
+  { const long np = lseek(fd, off, whence);
+    struct TrEntry *te = tr_by_fd(fd);
+    if (te) { te->lseeks++; tr_op(te, 's', -1, off, np, whence, 2); }
+    return np; }
 }
 
 static const char *synthetic_proc(const char *path);  /* defined below */
@@ -702,6 +2187,14 @@ int open_fake(const char *path, int flags, ...) {
   if (flags & LINUX_O_CREAT) { va_list va; va_start(va, flags); mode = va_arg(va, int); va_end(va); }
   const int cvt = convert_open_flags(flags);
   const int writing = (flags & 3) != 0 || (flags & LINUX_O_CREAT);
+  if (writing && cache_protected_write(path)) {
+    static unsigned nb;
+    if (nb < 20) { nb++;
+      tr_log("[cache] BLOCKED write-open of %s -- committed entries are "
+                  "read-only while offline\n", path); }
+    errno = EACCES;
+    return -1;
+  }
   if (!writing) {
     /* Packed assets win over the filesystem: once the pack is built the loose
      * tree is deleted, so this is the only place the data exists. */
@@ -750,13 +2243,70 @@ int open_fake(const char *path, int flags, ...) {
       if (TRACE_IO) debugPrintf("[io] open(%s,0x%x) -> %d size=%lld\n", path, flags, fd, (long long)_st.st_size);
       /* Big read-only asset files (data.unity3d ~424MB, sharedassets*.resource)
        * get a read-ahead cache so Unity's tiny per-field reads hit RAM, not SD. */
-      if (!writing && _st.st_size >= (4 << 20))
-        ra_attach(fd, (long)_st.st_size);
+      if (writing) { fb_invalidate(path); dlw_open(fd, path); }
+      const int mode = writing ? 0 : residency_mode(path, (long)_st.st_size);
+      if (mode)
+        ra_attach_path(fd, (long)_st.st_size, mode == 2 ? path : NULL);
+      { struct TrEntry *te = tr_get(path);
+        if (te) {
+          te->opens++;
+          te->file_size = (long)_st.st_size;
+          { struct RaCache *rc = ra_find(fd); te->resident = rc && rc->resident; }
+          tr_bind(fd, te);
+          tr_op(te, 'o', 0, writing, fd, 0, te->resident);
+          if (g_tr_lines < 400) { g_tr_lines++;
+            tr_log("[trace] open  %s fd=%d size=%ld %s\n", te->key, fd,
+                        te->file_size, te->resident ? "(served from RAM)"
+                                                    : "(served from card)"); }
+        } }
     } else {
       if (TRACE_IO) debugPrintf("[io] open(%s,0x%x) -> %d size=?\n", path, flags, fd);
     }
   } else {
     if (TRACE_IO) debugPrintf("[io] open(%s,0x%x) -> %d\n", path, flags, fd);
+  }
+  /* A failed open of game CONTENT, reported whatever TRACE_IO is set to.
+   *
+   * "The game is not being given the files it needs" is a hypothesis worth a
+   * direct answer rather than an inference from what it does next. If a read
+   * path is wrong -- a pack entry that does not resolve, a redirect that lands
+   * somewhere else, a cache entry the game looks for under a name this port
+   * does not produce -- it shows up here as the exact path that came back -1.
+   *
+   * Bounded, and only for content: the engine probes for plenty of files that
+   * are genuinely absent (locale variants, optional configs) and those are not
+   * interesting. Reads are what matter, so writes and creates are excluded. */
+  if (fd < 0 && !writing && path &&
+      (strstr(path, "/assets/") || strstr(path, "/UnityCache/") ||
+       strstr(path, "/files/"))) {
+    /* Two of these are normal and were each mistaken for the fault once.
+     *
+     * UnityCache/Shared/<id>/__info at depth 2 is how Unity asks "do I hold a
+     * cache entry with this id?". ENOENT is the correct answer unless the entry
+     * exists -- and in a cache known to work, that file exists for NONE of the
+     * thirty entries. Making it succeed would be worse than leaving it: Unity
+     * would then look for a __data that is not there.
+     *
+     * Analytics/ArchivedEvents/.../p is Unity Analytics checking for queued
+     * events it has not written.
+     *
+     * Both are labelled rather than hidden, so a real miss still stands out. */
+    const char *why = "";
+    const char *tail = strstr(path, "/UnityCache/Shared/");
+    if (tail) {
+      const char *rest = tail + strlen("/UnityCache/Shared/");
+      const char *slash = strchr(rest, '/');
+      if (slash && !strcmp(slash, "/__info"))
+        why = "  [normal: Unity asking whether this entry is cached]";
+    } else if (strstr(path, "/Analytics/ArchivedEvents/")) {
+      why = "  [normal: analytics queue probe]";
+    }
+    static unsigned nmiss;
+    if (nmiss < 40) {
+      nmiss++;
+      tr_log("[miss] the game asked for %s and did not get it (errno %d)%s\n",
+                  path, errno, why);
+    }
   }
   return fd;
 }
@@ -768,7 +2318,15 @@ int openat_fake(int dirfd, const char *path, int flags, ...) {
   // creation and basename fallback all apply (some libc paths route open->openat).
   return open_fake(path, flags, mode);
 }
-int unlinkat_fake(int dirfd, const char *path, int flags) { (void)dirfd; (void)flags; return unlink(path); }
+int unlinkat_fake(int dirfd, const char *path, int flags) {
+  (void)dirfd; (void)flags;
+  { extern int bp_cache_block_delete(const char *p, const char *how);
+    if (bp_cache_block_delete(path, "unlinkat")) return 0; }
+  if (path && strstr(path, "/UnityCache/"))
+    debugPrintf("[cache] the GAME deleted %s (via unlinkat)\n", path);
+  fb_invalidate(path);          /* same reason as remove_fake/unlink_fake */
+  return unlink(path);
+}
 
 // ---------------------------------------------------------------------------
 // struct stat conversion (bionic aarch64 layout)
@@ -827,6 +2385,74 @@ int rename_fake(const char *oldp, const char *newp) {
   char rb1[512], rb2[512];
   oldp = asset_redirect(oldp, rb1, sizeof rb1);
   newp = asset_redirect(newp, rb2, sizeof rb2);
+  /* NEVER TOUCH THE DESTINATION IF THE SOURCE IS NOT THERE.
+   *
+   * POSIX rename() with a missing source is ENOENT and leaves the destination
+   * alone. This did not: it went straight to the displace-and-swap dance below,
+   * which moves the destination aside first. So a rename whose source did not
+   * exist would park a good file at <dest>.rnold, fail, and -- if the rollback
+   * also failed -- strand it there for the next call's remove() to delete.
+   *
+   * That is not hypothetical. Unity commits a downloaded bundle by writing
+   * <hash>_tmp/__data_tmp and renaming it over <hash>/__data. With no network
+   * the download fails and the _tmp source is cleaned up -- the log shows Unity
+   * unlinking exactly those files -- and the commit rename then ran against a
+   * source that was already gone. Three entries, about 41 MB, disappeared from
+   * the card every session this way, and kept disappearing after each recopy. */
+  /* A rename that LANDS on __info is Unity rewriting its bookkeeping; allow it.
+   * One that lands on __data would replace content, which is what must not
+   * happen while the source cannot possibly be a good download.
+   *
+   * MOVING __info AWAY IS A DELETE WEARING A RENAME'S CLOTHES, and two
+   * exemptions that are each correct on their own compose into a hole:
+   *
+   *   rename(<entry>/__info -> <entry>/__info_tmp)
+   *        oldp: is_info_file  -> cache_protected_write() exempts it
+   *        newp: contains _tmp -> cache_locked_now() exempts it
+   *        => ALLOWED
+   *   unlink(<entry>/__info_tmp)
+   *        contains _tmp       -> exempt
+   *        => ALLOWED
+   *
+   * Net effect: __info is laundered through a _tmp name and destroyed, while
+   * the rename of the entry directory, the rename of __data, the unlink of
+   * __data and the rmdir are all correctly refused. The entry keeps its
+   * content and loses its bookkeeping, walk_cache() then counts it incomplete,
+   * and the census drops by exactly that entry's __data size -- which is what
+   * "two entries, 38 MB gone" was. The content never left the card.
+   *
+   * So: allow __info -> __info (a commit from staging), allow writes to
+   * __info, refuse __info -> anything that is not an __info. */
+  if (cache_protected_write(oldp) || cache_protected_write(newp) ||
+      (cache_locked_now(oldp) && is_info_file(oldp) && !is_info_file(newp))) {
+    static unsigned nr;
+    if (nr < 20) { nr++;
+      tr_log("[cache] BLOCKED rename %s -> %s -- committed entries are "
+             "read-only while offline\n", oldp, newp); }
+    errno = EACCES;
+    return -1;
+  }
+
+  struct stat sst;
+  if (stat(oldp, &sst) != 0) {
+    /* Report only when there was something to lose. The engine renames plenty
+     * of paths that are served from the pack and have no real file behind them
+     * -- 32 of those in one boot -- and a refusal there changes nothing, since
+     * the destination does not exist either. The case worth seeing is a missing
+     * source with a REAL destination: that is the one that used to displace a
+     * good file and strand it. */
+    struct stat dst;
+    if (stat(newp, &dst) == 0)
+      tr_log("[io] rename(%s -> %s) refused: the SOURCE does not exist and the "
+             "destination DOES -- left untouched\n", oldp, newp);
+    errno = ENOENT;
+    return -1;
+  }
+
+  /* A rename replaces the destination's contents with no write-open on it, so
+   * this is the one mutation route a resident copy would not otherwise see.
+   * Unity commits downloads by renaming Temp/ over Shared/. */
+  fb_invalidate(newp);
 
   if (rename(oldp, newp) == 0) return 0;          /* 1. destination absent: plain rename */
 
@@ -839,15 +2465,29 @@ int rename_fake(const char *oldp, const char *newp) {
   /* 2. park the destination aside */
   char aside[576];
   snprintf(aside, sizeof aside, "%s.rnold", newp);
-  remove(aside);                                  /* stale one from an interrupted swap */
+  /* A leftover .rnold is not litter -- it is a destination that was parked and
+   * never restored, i.e. the only surviving copy. Deleting it was how the loss
+   * became permanent. If the real path is missing, put it back. */
+  {
+    struct stat ast, nst;
+    if (stat(aside, &ast) == 0) {
+      if (stat(newp, &nst) != 0 && rename(aside, newp) == 0)
+        debugPrintf("[io] recovered %s from an interrupted rename\n", newp);
+      else
+        remove(aside);
+    }
+  }
   if (rename(newp, aside) == 0) {
     if (rename(oldp, newp) == 0) {
       remove(aside);
       if (TRACE_IO) debugPrintf("[io] rename(%s -> %s) ok (displaced existing)\n", oldp, newp);
       return 0;
     }
-    rename(aside, newp);                          /* roll back: restore the old file */
-    if (TRACE_IO) debugPrintf("[io] rename(%s -> %s) FAILED, original restored (errno %d)\n", oldp, newp, errno);
+    if (rename(aside, newp) != 0)
+      debugPrintf("[io] rename(%s -> %s) failed AND the original could not be put "
+                  "back -- it is parked at %s\n", oldp, newp, aside);
+    else if (TRACE_IO)
+      debugPrintf("[io] rename(%s -> %s) FAILED, original restored (errno %d)\n", oldp, newp, errno);
     return -1;
   }
 
@@ -868,7 +2508,9 @@ int rename_fake(const char *oldp, const char *newp) {
     int ok = 0;
     if (rename(newp, aside) == 0) {
       if (rename(oldp, newp) == 0) { remove(aside); ok = 1; }
-      else rename(aside, newp);                 /* roll back */
+      else if (rename(aside, newp) != 0)
+        debugPrintf("[io] rename(%s -> %s) failed AND the original could not be put "
+                    "back -- it is parked at %s\n", oldp, newp, aside);
     }
     int re = open(newp, O_RDONLY);              /* re-occupy the fd number for the caller */
     if (re >= 0) {
@@ -992,6 +2634,21 @@ int fstat_fake(int fd, struct bionic_stat *st) {
       uint64_t ino = (fd >= 0 && fd < FD_INO_MAX) ? g_fd_ino[fd] : 0;
       st->st_ino = ino ? ino : ((uint64_t)(fd + 1) * 2654435761ULL) | 1;
     }
+    /* What the game is TOLD about a cached entry, and whether it matches the
+     * size the residency was built from. A disagreement here would make Unity
+     * think the bundle is the wrong length, which is one of the three things
+     * left that could explain an eviction with correct data. */
+    { struct TrEntry *te = tr_by_fd(fd);
+      if (te) {
+        te->fstats++;
+        tr_op(te, 'f', 0, 0, (int64_t)real.st_size, 0, 0);
+        if (te->file_size && (long)real.st_size != te->file_size)
+          tr_log("[trace] FSTAT MISMATCH %s: open saw %ld, fstat now says %ld\n",
+                      te->key, te->file_size, (long)real.st_size);
+        else if (g_tr_lines < 400) { g_tr_lines++;
+          tr_log("[trace] fstat %s fd=%d -> size %ld\n",
+                      te->key, fd, (long)real.st_size); }
+      } }
   }
   return r;
 }
@@ -1002,6 +2659,7 @@ int lstat_fake(const char *path, struct bionic_stat *st) { return stat_fake(path
 int truncate_fake(const char *path, long len) {
   char rb[512];
   path = asset_redirect(path, rb, sizeof rb);
+  fb_invalidate(path);
   const int ofd = fd_open_on_path(path);
   if (ofd >= 0) return ftruncate(ofd, (off_t)len);
   int fd = open(path, O_WRONLY);
@@ -1394,11 +3052,21 @@ static void mmap_arena_init_locked(void) {
     usable = g_mmap_arena_size;
   } else {
     // fallback (small heap / applet): memalign a modest arena (< 2GB newlib limit)
-    const size_t want = (size_t)768 * 1024 * 1024 + MMAP_BIG_ALIGN;
-    uint8_t *raw = memalign(MMAP_PAGE, want);
-    if (!raw) fatal_error("mmap arena alloc (%u MB) failed", (unsigned)(want >> 20));
-    base   = (uint8_t *)(((uintptr_t)raw + (MMAP_BIG_ALIGN - 1)) & ~(MMAP_BIG_ALIGN - 1));
-    usable = (size_t)768 * 1024 * 1024;
+    /* Ask the allocator for the big alignment directly: dlmalloc's memalign
+     * returns the leading slack to the heap, where the old memalign(4 KB) +
+     * manual align-up left up to MMAP_BIG_ALIGN (64 MB) dead inside the chunk.
+     * The heap was at 2079 MB in use with 58 MB free before the game had
+     * loaded a level; every megabyte here is one Unity gets back. Falls back
+     * to the old path if the allocator cannot do the alignment. */
+    usable = (size_t)bp_mmap_arena_mb * 1024 * 1024;
+    uint8_t *raw = memalign(MMAP_BIG_ALIGN, usable);
+    if (raw) base = raw;
+    else {
+      const size_t want = usable + MMAP_BIG_ALIGN;
+      raw = memalign(MMAP_PAGE, want);
+      if (!raw) fatal_error("mmap arena alloc (%u MB) failed", (unsigned)(want >> 20));
+      base = (uint8_t *)(((uintptr_t)raw + (MMAP_BIG_ALIGN - 1)) & ~(MMAP_BIG_ALIGN - 1));
+    }
   }
   size_t pages  = usable / MMAP_PAGE;
   uint8_t *used = (uint8_t *)calloc(pages, 1);
@@ -1493,6 +3161,23 @@ static void mmap_arena_free(void *addr, size_t len) {
 static struct { void *ptr; size_t len; } g_fb[MMAP_FALLBACK_MAX];
 static int   g_fb_n = 0;
 static size_t g_fb_bytes = 0;
+static size_t g_arena_peak_pages;   /* high-water mark of reserved arena pages */
+static size_t g_fb_leaked;          /* held by refused partial munmaps -- see mmap_fallback_free */
+/* For the [mem] breakdown: what the mmap arena and the fallback path hold. */
+size_t bp_mmap_leaked(void) { return g_fb_leaked; }
+void bp_mmap_stats(size_t *arena_reserved, size_t *arena_used, size_t *arena_peak, size_t *fallback) {
+  size_t used = 0;
+  if (mmap_used) for (size_t i = 0; i < mmap_pages; i++) used += mmap_used[i] ? 1 : 0;
+  if (used > g_arena_peak_pages) g_arena_peak_pages = used;
+  if (arena_reserved) *arena_reserved = mmap_pages * MMAP_PAGE;
+  if (arena_used)     *arena_used     = used * MMAP_PAGE;
+  if (arena_peak)     *arena_peak     = g_arena_peak_pages * MMAP_PAGE;
+  if (fallback)       *fallback       = g_fb_bytes;
+}
+void bp_ram_stats(size_t *image, size_t *image_used) {
+  if (image) *image = g_image_cap;
+  if (image_used) *image_used = g_image_used;
+}
 static Mutex g_fb_lock;
 
 static void *mmap_fallback(size_t length, int flags, int fd, long offset) {
@@ -1528,10 +3213,33 @@ static void *mmap_fallback(size_t length, int flags, int fd, long offset) {
 }
 
 // returns 1 and frees if addr was a fallback allocation
-static int mmap_fallback_free(void *addr) {
+static int mmap_fallback_free(void *addr, size_t length) {
   mutexLock(&g_fb_lock);
   for (int i = 0; i < g_fb_n; i++) {
     if (g_fb[i].ptr == addr) {
+      /* THE LENGTH MATTERS. This freed the whole chunk on a pointer match and
+       * never looked at length, so an engine allocator trimming the HEAD of a
+       * reservation -- munmap(base, first_n_pages) -- freed the entire
+       * mapping while the engine kept using the rest, and the allocator handed
+       * that memory to whoever malloc'd next. A partial unmap is refused here
+       * and logged: a bounded leak beats a use-after-free that surfaces as
+       * zeros in someone else's buffer. */
+      if (length && length < g_fb[i].len) {
+        const size_t whole = g_fb[i].len;
+        /* Unity over-maps and trims: it asks for 128 MB to get an aligned
+         * 64 MB block, then munmaps the half it does not want. We cannot
+         * return part of a malloc chunk, so the trimmed half is HELD -- every
+         * fallback map costs double. Counted here so the [mem] line shows it;
+         * the real fix is an mmap arena large enough that this path is never
+         * taken, which is what mmap_arena_mb is now sized for. */
+        g_fb_leaked += length;
+        mutexUnlock(&g_fb_lock);                /* log OUTSIDE the lock */
+        static unsigned told;
+        if (told < 8) { told++;
+          debugPrintf("[mmap] PARTIAL munmap(%p, %zu) of a %zu-byte fallback map -- "
+                      "refused (kept whole)\n", addr, length, whole); }
+        return 1;
+      }
       free(addr);
       g_fb_bytes -= g_fb[i].len;
       g_fb[i] = g_fb[--g_fb_n];
@@ -1597,13 +3305,22 @@ static void *mmap_fixed_anon(void *addr, size_t len, int prot) {
     }
     return addr;                                   /* PROT_NONE: left mapped (as mprotect_fake does) */
   }
-  /* newlib-fallback allocations: accept only if the whole range is mapped RW */
-  MemoryInfo mi; u32 pi;
-  if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u64)(uintptr_t)addr)) &&
-      (mi.perm & Perm_Rw) == Perm_Rw && mi.addr + mi.size >= (u64)(uintptr_t)addr + len) {
-    if (prot != BIONIC_PROT_NONE) memset(addr, 0, len);
-    return addr;
-  }
+  /* newlib-fallback allocations: ONLY ranges this shim actually handed out.
+   *
+   * This used to accept any address whose pages were mapped RW -- which is the
+   * entire newlib heap, every RAM-cache blob included -- and memset it to zero.
+   * The comment above it said "fallback allocations"; the check said "anything
+   * writable". Consult the fallback list and the map cache instead, and refuse
+   * the rest. A refusal is logged with the address so a caller that believed
+   * it owned that memory shows up as exactly that. */
+  { int owned = 0;
+    mutexLock(&g_fb_lock);
+    for (int i = 0; i < g_fb_n && !owned; i++)
+      if (a >= (uint8_t *)g_fb[i].ptr && a + len <= (uint8_t *)g_fb[i].ptr + g_fb[i].len) owned = 1;
+    for (int i = 0; i < g_mapc_n && !owned; i++)
+      if (a >= (uint8_t *)g_mapc[i].ptr && a + len <= (uint8_t *)g_mapc[i].ptr + g_mapc[i].len) owned = 1;
+    mutexUnlock(&g_fb_lock);
+    if (owned) { if (prot != BIONIC_PROT_NONE) memset(addr, 0, len); return addr; } }
   debugPrintf("[mmap] MAP_FIXED %p len=%zu prot=0x%x is not memory this shim owns -> ENOMEM\n", addr, len, prot);
   return NULL;
 }
@@ -1641,10 +3358,18 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
   mmap_arena_init_locked();
   void *p = mmap_arena_alloc_locked(length, &reserved);
   mutexUnlock(&g_mmap_lock);
+  /* NOT behind TRACE_MMAP any more. These are >=64 MB maps -- a handful per
+   * run -- and the arena has been sized by guesswork for want of exactly this
+   * line. p==NULL here means the arena could not place it and the caller is
+   * about to fall back to the newlib heap, which is the fragmentation the
+   * arena exists to prevent: say so loudly, because undersizing
+   * mmap_arena_mb shows up here first and nowhere else. */
   if (length >= MMAP_BIG_THRESH)
-    if (TRACE_MMAP) debugPrintf("[mmap] %u MB (prot=0x%x anon=%d) -> %p  [reserved %u MB]\n",
-                (unsigned)(length >> 20), prot, !!(flags & BIONIC_MAP_ANONYMOUS), p,
-                (unsigned)(reserved >> 20));
+    debugPrintf("[mmap] %u MB request (prot=0x%x anon=%d) -> %s%p [arena reserved %u MB]%s\n",
+                (unsigned)(length >> 20), prot, !!(flags & BIONIC_MAP_ANONYMOUS),
+                p ? "" : "ARENA FULL, falling back to the heap ", p,
+                (unsigned)(reserved >> 20),
+                p ? "" : "  *** raise mmap_arena_mb ***");
   /* A file-backed map must be contiguous and fully readable. When the arena can
    * only give a tail-overflow reservation (reserved < length) we'd read just
    * `fill` bytes and leave the tail unfilled -- silently truncating the file in
@@ -1720,7 +3445,7 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
 }
 
 int munmap_fake(void *addr, size_t length) {
-  if (mmap_fallback_free(addr)) return 0;   // newlib fallback allocation
+  if (mmap_fallback_free(addr, length)) return 0;   // newlib fallback allocation
   if (oc_contains(addr)) {                   // stack-region OC reservation
     mutexLock(&g_mmap_lock);
     oc_free_locked(addr, length);
@@ -1971,9 +3696,80 @@ int vfprintf_fake(FILE *f, const char *fmt, va_list va) {
 // ---------------------------------------------------------------------------
 
 long read_fake(int fd, void *buf, size_t count) {
+  /* Any read the game makes defers the prefetch. Marking only cached reads
+   * would miss the uncached majority -- which is most of what it does while
+   * loading, and exactly when the card must be left alone. */
+  g_last_game_read = armTicksToNs(armGetSystemTick());
   if (asset_pack_fd_is(fd)) return asset_pack_read_fd(fd, buf, count);
   if (fakefd_is_fake(fd)) return fakefd_read(fd, buf, count);
-  { struct RaCache *c = ra_find(fd); if (c) return ra_read(c, fd, buf, count); }
+  { struct RaCache *c = ra_find(fd);
+    if (c) {
+      const long real_before = lseek(fd, 0, SEEK_CUR);   /* for the SHORT READ line only */
+      /* Timing experiment -- see config.h ram_delay_ms. Resident only, first
+       * read after open only, so the cost is one sleep per bundle open. */
+      if (bp_ram_delay_ms > 0 && c->resident) {
+        struct TrEntry *t0 = tr_by_fd(fd);
+        if (t0 && t0->reads_this_open == 0) svcSleepThread((u64)bp_ram_delay_ms * 1000000ull);
+      }
+      const long got = ra_read(c, fd, buf, count);
+      struct TrEntry *te = tr_by_fd(fd);
+      if (te) {
+        te->reads++; te->reads_this_open++;
+        tr_op(te, c->resident ? 'r' : 'R', real_before, (int64_t)count, got, 0, 1);
+        /* WHAT DID UNITY ACTUALLY GET. On the second open of an evicted bundle
+         * Unity reads 64 bytes at offset 0, then seeks to 1 -- which is what its
+         * string reader does when byte 0 is NUL -- and logs "Unable to read
+         * header from archive file". The verifier said those 64 bytes matched
+         * the card, and the card starts with "UnityFS". Both cannot be true of
+         * the same buffer, so this prints the buffer itself, the return value
+         * Unity was handed, and errno, on the first read of every open. */
+        /* Only the interesting cases, so this stays rare: a header read on a
+         * re-open (only evicted entries get re-opened at 0), or any first read
+         * at 0 that is not UnityFS. */
+        if (te->reads_this_open == 1 && real_before == 0 &&
+            (te->opens >= 2 || got < 8 || memcmp(buf, "UnityFS", 7) != 0)) {
+          const unsigned char *b = buf;
+          char hex[64]; size_t hn = 0;
+          for (size_t k = 0; k < 16 && k < (size_t)(got > 0 ? got : 0) && hn < sizeof hex - 3; k++)
+            hn += (size_t)snprintf(hex + hn, sizeof hex - hn, "%02x", b[k]);
+          tr_log("[evict] FIRST READ %s open#%u fd=%d at %ld: want=%zu got=%ld errno=%d "
+                 "buf[0..16]=%s  %s\n", te->key, te->opens, fd, real_before, count, got, errno,
+                 hn ? hex : "(none)",
+                 (got >= 8 && !memcmp(buf, "UnityFS", 7)) ? "= UnityFS" : "= NOT UnityFS");
+        }
+        if (got >= 0 && (size_t)got < count) {
+          te->short_reads++;
+          /* THE ONE ANOMALY THE COUNTERS SHOW. Every evicted entry has exactly
+           * one short read, and the eviction follows it. This line says which
+           * read it was. A short read at pos >= size is a benign EOF probe and
+           * Unity is reacting to something else; a short read with room left
+           * in the file means this layer returned fewer bytes than the card
+           * would have, and that IS the eviction. Rare by definition, so it
+           * flushes on sight under the eviction prefix. */
+          tr_log("[evict] SHORT READ %s fd=%d want=%zu got=%ld at pos=%ld "
+                 "(size=%ld, room=%ld) %s%s\n",
+                 te->key, fd, count, got, real_before,
+                 (long)c->size, (long)c->size - real_before,
+                 c->resident ? "RAM" : "window",
+                 /* got == room is a correct EOF-bounded read: the card would
+                  * answer the same. Only got < room is this layer's fault. */
+                 got >= (long)c->size - real_before ? " -- EOF-bounded, correct" : " -- TRUNCATED");
+        }
+        if (got > 0) { if (c->resident) te->bytes_ram += (uint64_t)got;
+                       else te->bytes_card += (uint64_t)got; }
+        te->last_off = c->pos;
+        /* Only the first couple of reads per entry get a line. The counters
+         * below record every one, and the flood was the problem: 400 lines
+         * drained 24 per frame is 400 blocking writes to a card the game is
+         * reading from, which stalled the log lock past the watchdog's limit
+         * twice. Shape is what these lines are for, and two reads show it. */
+        if (te->reads <= 2) {
+          tr_log("[trace] read  %s fd=%d want=%zu got=%ld -> pos %ld %s\n",
+                 te->key, fd, count, got, c->pos, c->resident ? "(RAM)" : "(card)");
+        }
+      }
+      return got;
+    } }
   /* fsdev can return fewer bytes than requested for a large read; il2cpp's
    * global-metadata.dat loader (and others) assume a single read() fills the
    * buffer. Loop until `count` is satisfied or we hit EOF/error so the metadata
@@ -1989,11 +3785,19 @@ long read_fake(int fd, void *buf, size_t count) {
   if (count >= (1u << 20))
     if (TRACE_IO) debugPrintf("[io] read(fd=%d, %zu) -> %zu%s\n", fd, count, total,
                 total < count ? "  *** SHORT READ ***" : "");
+  { struct TrEntry *te = tr_by_fd(fd);
+    if (te) { te->reads++;
+              if (total < count) te->short_reads++;
+              te->bytes_card += total;
+              /* position BEFORE this read = after it, minus what it returned */
+              const long after = lseek(fd, 0, SEEK_CUR);
+              tr_op(te, 'C', after >= 0 ? after - (long)total : -1, (int64_t)count, (int64_t)total, 0, 2); } }
   watch_dump("read", fd, (long)count, 0, buf, (long)total);
   return (long)total;
 }
 long write_fake(int fd, const void *buf, size_t count) {
   if (fakefd_is_fake(fd)) return fakefd_write(fd, buf, count);
+  dlw_wrote(fd, (long)count);
   /* stdout/stderr go nowhere on Switch. Boehm writes its ABORT text to stderr
    * just before calling abort(), and the fifth run's GC abort left no message
    * at all -- it had to be recovered from disassembly. Mirror them into
@@ -2008,6 +3812,28 @@ long write_fake(int fd, const void *buf, size_t count) {
 }
 int close_fake(int fd) {
   if (asset_pack_fd_is(fd)) return asset_pack_close_fd(fd);
+  { struct TrEntry *te = tr_by_fd(fd);
+    if (te) {
+      te->closes++;
+      if (g_tr_lines < 400) { g_tr_lines++;
+        tr_log("[trace] close %s fd=%d after %u read(s), %llu KB\n",
+                    te->key, fd, te->reads,
+                    (te->bytes_ram + te->bytes_card) >> 10); }
+      tr_op(te, 'c', 0, 0, 0, 0, 0);
+      tr_ops_dump(te, fd);
+      /* Full checksum at close of a resident entry. Heavy: shared_stuff is
+       * 118 MB, so this is ~100 ms on the closing thread. diag_io only. */
+      if (bp_diag_io) { struct RaCache *cc = ra_find(fd);
+        if (cc && cc->resident && cc->buf) {
+          int bi = -1;
+          mutexLock(&g_ram_lock);
+          for (int i = 0; i < g_blob_count; i++)
+            if (g_blob[i].data == cc->buf) { bi = i; break; }
+          mutexUnlock(&g_ram_lock);
+          if (bi >= 0) blob_report(bi, "close", 0); } }
+      tr_unbind(fd);
+    } }
+  dlw_close(fd);
   { extern void bpn_untrack(int); bpn_untrack(fd); }
   ra_detach(fd);
   fd_ino_clear(fd);
@@ -2486,11 +4312,38 @@ int pthread_kill_gc(pthread_t t, int sig) {
      * wants an acknowledgement, never whether a thread gets to run again. Log
      * only once nothing of ours is still paused (same stdio-lock hazard). */
     if (diag_resume_pthread((void *)t) && g_gc_paused_live) g_gc_paused_live--;
+    /* REPORT EVERY ROUND THAT MISSES A STACK, not just the first.
+     *
+     * A thread that is paused but whose stack and registers are not published
+     * has its roots invisible to the collector. Anything only that thread still
+     * referenced becomes free to collect, and the failure does not appear here:
+     * it appears later as a live object that has been reclaimed. The crash in
+     * these logs has exactly that shape -- a container holding a non-zero count
+     * and a NULL pointer, walked by a marking loop.
+     *
+     * The first round is two threads and always clean. By the time the game is
+     * loading AssetBundles it has thirty, and no round after the first was being
+     * watched at all. */
     static int logged_r = 0;
-    if (!logged_r && g_gc_paused_live == 0) { logged_r = 1;
-      debugPrintf("[gc] start-world: all resumed; first round paused %d of %d threads, published"
-                  " %d stacks (%d not: those threads' roots were missed)\n",
-                  g_gc_paused_ok, g_gc_paused_try, g_gc_published, g_gc_unpublished); }
+    static unsigned round_no, miss_rounds;
+    static int last_pub, last_unpub;
+    if (g_gc_paused_live == 0) {
+      const int pub = g_gc_published - last_pub;
+      const int unpub = g_gc_unpublished - last_unpub;
+      last_pub = g_gc_published; last_unpub = g_gc_unpublished;
+      round_no++;
+      if (!logged_r) { logged_r = 1;
+        debugPrintf("[gc] start-world: all resumed; first round paused %d of %d threads, "
+                    "published %d stacks (%d not)\n",
+                    g_gc_paused_ok, g_gc_paused_try, pub, unpub); }
+      else if (unpub > 0 && miss_rounds < 12) {
+        miss_rounds++;
+        debugPrintf("[gc] ROUND %u MISSED %d of %d stacks -- those threads' roots were "
+                    "invisible to the collector, so anything only they referenced "
+                    "could be freed while still live\n",
+                    round_no, unpub, pub + unpub);
+      }
+    }
     if (*(volatile int *)(b + GC_START_ACK_OFF)) sem_post_fake(ack_sem);
     return 0;
   }

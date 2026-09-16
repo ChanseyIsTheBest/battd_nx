@@ -483,12 +483,17 @@ int pthread_setspecific_fake(unsigned key, const void *value) {
 // ---------------------------------------------------------------------------
 
 static int ret0_i(void) { return 0; }
-static int retm1_i(void) { return -1; }
+/* These three are unreferenced -- inherited that way from bloonspop_nx, where
+ * they are equally dead. Marked unused rather than deleted: the note at the
+ * inet_pton entry below explains when retm1_i is the right answer, and the
+ * ioctl/fcntl pair are the obvious stubs to reach for if either import ever
+ * needs one. Deleting them would just mean rewriting them later. */
+__attribute__((unused)) static int retm1_i(void) { return -1; }
 static unsigned ret0_u(void) { return 0; }
 static int signal_stub(int s, void *h) { (void)s; (void)h; return 0; }
 static int sigaction_stub(int s, const void *a, void *o) { (void)s; (void)a; (void)o; return 0; }
-static int ioctl_stub(int fd, unsigned long req, ...) { (void)fd; (void)req; return -1; }
-static int fcntl_stub(int fd, int cmd, ...) { (void)fd; (void)cmd; return 0; }
+__attribute__((unused)) static int ioctl_stub(int fd, unsigned long req, ...) { (void)fd; (void)req; return -1; }
+__attribute__((unused)) static int fcntl_stub(int fd, int cmd, ...) { (void)fd; (void)cmd; return 0; }
 static int tcgetattr_stub(int fd, void *t) { (void)fd; if (t) memset(t, 0, 60); return 0; }
 static int tcsetattr_stub(int fd, int opt, const void *t) { (void)fd; (void)opt; (void)t; return 0; }
 
@@ -508,9 +513,76 @@ static int access_impl(const char *path, int mode) {
 
 static int chmod_stub(const char *path, int mode) { (void)path; (void)mode; return 0; }
 int truncate_fake(const char *path, long len);   /* libc_shim.c: real, open-handle aware */
-static int ftruncate_stub(int fd, long len) { return ftruncate(fd, (off_t)len); }
+/* A real truncate despite the name, so anything held for this fd is now wrong. */
+/* Deleting a path invalidates anything held for it. fb_resident() keys on
+ * path+size, so a file recreated at the same size with different contents would
+ * otherwise be served from the old copy. */
+/* Report any deletion inside UnityCache.
+ *
+ * Cache entries have gone missing between launches and nobody knew who removed
+ * them. This port does not: remove_tree() only ever runs on <root>/assets, and
+ * asset_pack.c only unlinks its own pack and index. So it is the game, and this
+ * says so with the path -- which turns "the files vanished" into a line naming
+ * the file and the moment. */
+static void note_cache_delete(const char *p, const char *how) {
+  if (p && strstr(p, "/UnityCache/")) {
+    extern volatile int g_cache_recheck;
+    extern void bp_tr_dump(const char *path, const char *why);
+    { extern void bp_tr_log_line(const char *s);
+      char m[220]; snprintf(m, sizeof m, "[cache] the GAME deleted %s (via %s)\n", p, how);
+      bp_tr_log_line(m); }
+    /* Print everything the game did to this entry before removing it. "Opened
+     * twice, read 64 bytes, never read the rest, then deleted it" is a
+     * diagnosis; "the game evicts entries" is not. */
+    bp_tr_dump(p, how);
+    g_cache_recheck = 1;        /* check the frozen set on the next frame */
+  }
+}
+
+/* rmdir went straight to newlib, so a directory disappearing was invisible.
+ * It only removes EMPTY directories -- which means the files inside went
+ * first, and those unlinks are logged -- but "the entry directory is gone" is
+ * worth seeing next to them, and an unwrapped mutation of the cache is exactly
+ * the blind spot this has been chasing. */
+static int rmdir_fake(const char *p) {
+  { extern int bp_cache_block_delete(const char *p, const char *how);
+    if (bp_cache_block_delete(p, "rmdir")) return 0; }
+  note_cache_delete(p, "rmdir");
+  return rmdir(p);
+}
+static int remove_fake(const char *p) {
+  { extern int bp_cache_block_delete(const char *p, const char *how);
+    if (bp_cache_block_delete(p, "remove")) return 0; }
+  extern void bp_ram_forget_path(const char *path);
+  note_cache_delete(p, "remove");
+  bp_ram_forget_path(p);
+  return remove(p);
+}
+static int unlink_fake(const char *p) {
+  { extern int bp_cache_block_delete(const char *p, const char *how);
+    if (bp_cache_block_delete(p, "unlink")) return 0; }
+  extern void bp_ram_forget_path(const char *path);
+  note_cache_delete(p, "unlink");
+  bp_ram_forget_path(p);
+  return unlink(p);
+}
+
+static int ftruncate_stub(int fd, long len) {
+  extern void bp_ra_forget_fd(int fd);
+  bp_ra_forget_fd(fd);
+  return ftruncate(fd, (off_t)len);
+}
 static int fsync_stub(int fd) { int r = fsync(fd); fsdevCommitDevice("sdmc"); return r; }
-static int dup2_stub(int a, int b) { (void)a; return b; }
+/* dup2 aliases two descriptors onto one offset exactly as dup does, so the
+ * source has to stop being virtualised here too. The stub itself is unchanged:
+ * it reports success without really duplicating, which is what the callers that
+ * reach it need. */
+static int dup2_stub(int a, int b) {
+  extern void bp_ra_devirtualise(int fd);
+  bp_ra_devirtualise(a);
+  bp_ra_devirtualise(b);
+  return b;
+}
 static long pread_impl(int fd, void *buf, size_t n, long off) {
   if (asset_pack_fd_is(fd)) return asset_pack_pread_fd(fd, buf, n, off);
   long cur = lseek(fd, 0, SEEK_CUR);
@@ -523,6 +595,7 @@ static long pread_impl(int fd, void *buf, size_t n, long off) {
     total += (size_t)r;
   }
   lseek(fd, cur, SEEK_SET);
+  { extern void bp_tr_note_pread(int, long, size_t, long); bp_tr_note_pread(fd, off, n, (long)total); }
   watch_dump("pread", fd, (long)off, (long)n, buf, (long)total);
   return (long)total;
 }
@@ -932,7 +1005,7 @@ DynLibFunction dynlib_functions[] = {
   { "getwc", (uintptr_t)&getc_fake }, { "fputwc", (uintptr_t)&fputc_fake },
   { "ungetc", (uintptr_t)&ungetc_fake }, { "ungetwc", (uintptr_t)&ungetc_fake },
   { "feof", (uintptr_t)&feof_fake }, { "ferror", (uintptr_t)&ferror_fake },
-  { "fileno", (uintptr_t)&fileno_fake }, { "remove", (uintptr_t)&remove },
+  { "fileno", (uintptr_t)&fileno_fake }, { "remove", (uintptr_t)&remove_fake },
   { "rename", (uintptr_t)&rename_fake },   /* POSIX replace-dest semantics; see libc_shim.c */
 
   // --- filesystem ---
@@ -948,8 +1021,8 @@ DynLibFunction dynlib_functions[] = {
   { "stat", (uintptr_t)&stat_fake }, { "fstat", (uintptr_t)&fstat_fake },
   { "lstat", (uintptr_t)&lstat_fake }, { "statfs", (uintptr_t)&statfs_fake },
   { "statvfs", (uintptr_t)&statvfs_fake }, { "access", (uintptr_t)&access_impl },
-  { "mkdir", (uintptr_t)&mkdir_fake }, { "rmdir", (uintptr_t)&rmdir },
-  { "unlink", (uintptr_t)&unlink }, { "unlinkat", (uintptr_t)&unlinkat_fake },
+  { "mkdir", (uintptr_t)&mkdir_fake }, { "rmdir", (uintptr_t)&rmdir_fake },
+  { "unlink", (uintptr_t)&unlink_fake }, { "unlinkat", (uintptr_t)&unlinkat_fake },
   { "chdir", (uintptr_t)&chdir }, { "getcwd", (uintptr_t)&getcwd_fake },
   { "chmod", (uintptr_t)&chmod_stub }, { "fchmod", (uintptr_t)&fchmod_stub },
   { "fchmodat", (uintptr_t)&fchmodat_stub }, { "truncate", (uintptr_t)&truncate_fake },

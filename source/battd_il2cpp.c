@@ -189,10 +189,18 @@ static void hk_TryPlayNextVideoInWaterfall(void *self, void *source,
  * that calls nativeRender. battd_video_draw stays in the swap wrapper, because
  * that IS the GL thread and that is where its GL belongs. */
 void battd_il2cpp_pump(void) {
+  extern void bp_tr_log_line(const char *line);   /* libc_shim.c: the trace ring */
   if (!s_watching) return;
   if (battd_video_is_playing()) return;
-  debugPrintf("[video] clip finished -- exiting the splash\n");
+  /* Exit FIRST. This runs on UnityMain, and the old order put a flush-on-sight
+   * debugPrintf -- a synchronous card write -- between "the clip is over" and
+   * "let the game continue". A write that does not return there freezes the
+   * game on the last frame with the splash never told to end. The line itself
+   * goes through the trace ring, which is a memcpy on this thread and is
+   * drained next frame; if there is no next frame it was not the line that
+   * mattered. */
   splash_exit(s_splash_self);
+  bp_tr_log_line("[splash] clip finished -- TriggerAnimationExit called\n");
 }
 
 static const uint32_t k_trynext_guard[4] = {

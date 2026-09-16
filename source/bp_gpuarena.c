@@ -44,6 +44,7 @@
 #include <switch.h>
 
 #include "util.h"
+#include "config.h"
 
 /* Provided by the linker's --wrap: the genuine newlib entry points. */
 extern void *__real_memalign(size_t align, size_t size);
@@ -58,7 +59,7 @@ extern void  __real_free(void *p);
  * its buffers are ~3.5 MB rather than PvZ's ~8 MB, and it needs far less than
  * PvZ's 1152 MB -- but the arena costs only address space it would otherwise
  * have fragmented, so start generous. */
-#define GPUA_BYTES ((size_t)512 * 1024 * 1024)
+#define GPUA_BYTES ((size_t)bp_gpu_arena_mb * 1024 * 1024)   /* config.txt gpu_arena_mb */
 #define GPUA_FLOOR ((size_t)96 * 1024 * 1024)
 /* Below this, newlib is fine: small allocations do not cause the large-run
  * fragmentation this arena exists to prevent. */
@@ -86,6 +87,12 @@ static int       gpua_state;     /* 0 = untried, 1 = ready, -1 = disabled */
  * GPUA_MAX: either one alone would have prevented the frame-0 regression. */
 static int       gpua_enabled;
 static size_t    gpua_live_pages, gpua_peak_pages;
+/* For the [mem] breakdown: what the GPU arena has actually been asked for. */
+void bp_gpua_stats(size_t *reserved, size_t *live, size_t *peak) {
+  if (reserved) *reserved = gpua_used ? gpua_pages * 4096u : 0;
+  if (live)     *live     = gpua_live_pages * 4096u;
+  if (peak)     *peak     = gpua_peak_pages * 4096u;
+}
 
 unsigned bp_gpua_peak_mb(void);
 unsigned bp_gpua_live_mb(void);
@@ -224,6 +231,43 @@ void *__wrap_memalign(size_t align, size_t size) {
    * space -- not that the arena is too small. Raising GPUA_MAX to "fix" it would
    * route the engine's whole heap into an arena sized for 8 MB render targets. */
   if (!p && align >= GPUA_PAGE) {
+    /* Before reporting, give the RAM cache back and try once more. It is a
+     * cache: holding 300-odd MB of files is worth nothing next to an allocation
+     * the game actually needs, and this exact failure -- a 128 MB request on the
+     * character screen -- is what it cost. One retry only, and only after a real
+     * failure, so the fast path is untouched. */
+    extern long bp_ram_cache_release_all(void);
+    if (bp_ram_cache_release_all() > 0) {
+      p = __real_memalign(align, size);
+      if (p) return p;
+    }
+    /* Last resort: take it from the ARENA, even though it is outside the
+     * GPUA_MIN..GPUA_MAX routing window.
+     *
+     * The window governs which allocations are *routed* here by preference --
+     * deliberately narrow, so Unity's ~512 MB Dynamic Heap does not colonise an
+     * arena meant for render targets. It should not govern what happens once
+     * newlib has already said no. At that point the alternative is failing, and
+     * the arena is a 512 MB contiguous reservation that was sitting 280 MB idle
+     * when a 128 MB request was refused on the character screen: capacity we had
+     * taken from newlib and then declined to lend back.
+     *
+     * Contiguity, not capacity, is what runs out here. The heap is ~2.9 GB and
+     * barely touched; it is the big carve-outs -- this arena, and the cache
+     * blobs released above -- that leave no single run large enough. */
+    if (gpua_enabled && size > GPUA_MAX) {
+      p = gpua_alloc(size);
+      if (p) {
+        static unsigned nb;
+        if (nb < 4) {
+          nb++;
+          debugPrintf("[gpua] %u KB served from the arena reserve after newlib "
+                      "refused it (outside the routing window, but the space was "
+                      "free)\n", (unsigned)(size >> 10));
+        }
+        return p;
+      }
+    }
     static unsigned nf;
     if (nf < 3) {
       nf++;

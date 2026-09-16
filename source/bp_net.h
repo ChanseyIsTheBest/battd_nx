@@ -10,6 +10,14 @@ int  bp_net_install_ca(so_module *unity);  /* cacerts.pem -> unitytls CA list  *
 int  bp_net_online(void);                  /* nifm: internet connected?        */
 int  bp_net_reachability(void);            /* NetworkReachability: 0 or 2      */
 int  bp_net_is_offline(void);             /* cache complete: internet disabled */
+/* Ask the NEXT launch to come up online. Called when something is looked up
+ * while offline, which means the cache was incomplete. Self-heals in two boots
+ * without anyone editing config.txt. */
+void bp_net_request_online_next_boot(void);
+/* Call once per frame. Re-records the cache fingerprint at most once a minute,
+ * so a launch that downloads something does not cost an extra confirming launch
+ * before offline mode engages. */
+void bp_net_cache_state_refresh(void);
 
 /* bionic-ABI socket layer (bp_net_shim.c), wired in imports.c */
 int  bpn_socket(int d, int t, int p);
