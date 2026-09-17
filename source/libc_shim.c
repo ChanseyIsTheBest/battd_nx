@@ -21,6 +21,7 @@
 #include <strings.h>
 #include <math.h>
 #include <errno.h>
+#include <limits.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -1926,10 +1927,96 @@ void ra_detach(int fd) {
  * virtual. Every cached read reads the real position first and writes it back
  * after, which costs two cheap lseeks and no data transfer, and makes every
  * bypass -- present or future, ours or newlib's -- correct by construction. */
-static long ra_read(struct RaCache *c, int fd, void *buf, size_t count) {
+/* THE RESIDENT COPY RUNS WITHOUT THE LOCK, AND THAT IS ONLY TRUE NOW.
+ *
+ * g_ra_lock used to be held across the memcpy. Unity reads bundles from
+ * sixteen Background Job workers at once, so every read of every cached
+ * bundle queued on one mutex and parallel bundle loading became serial -- on
+ * four A57s that is three cores idle behind one memcpy.
+ *
+ * It was not safe to copy outside the lock under the old per-file blob store:
+ * three paths could free the buffer while a slot still pointed at it. With the
+ * single immutable image it is. Once fb_load_now commits an entry, its bytes
+ * never change and are never freed for the life of the process, and the refill
+ * branch below is skipped for resident slots so nothing writes into a blob.
+ * So the lock is taken only to snapshot the extent and publish the position;
+ * the copy itself touches memory nobody can mutate.
+ *
+ * The WINDOW path is unchanged and still copies under the lock -- c->buf there
+ * is a per-slot scratch buffer the refill genuinely rewrites.
+ *
+ * out_pos (optional) receives the position the fd was at BEFORE this read, so
+ * the caller does not have to ask for it with a second lseek. */
+static long ra_read_at(struct RaCache *c, int fd, void *buf, size_t count, long *out_pos) {
+  /* Snapshot the extent first, so the seek strategy below can depend on
+   * whether this slot is resident without a second trip through the lock. */
+  mutexLock(&g_ra_lock);
+  const int resident = c->resident;
+  const unsigned char *rbuf = (const unsigned char *)c->buf;
+  const long rbase = c->base, rlen = c->len;
+  mutexUnlock(&g_ra_lock);
+
+#if !BP_RAM_VERIFY_READS
+  if (resident && rbuf && count <= (size_t)LONG_MAX) {
+    /* ONE SEEK FOR A FULL READ, instead of one to learn the position and one
+     * to write it back.
+     *
+     * An lseek here is not just a call: devkitPro's fd operations go through
+     * newlib's __get_handle(), which takes a PROCESS-WIDE handle lock -- the
+     * same __hndl_lock that showed up in the exception-handler recursion. With
+     * sixteen Unity workers reading bundles, two seeks per read is two global
+     * lock acquisitions per read.
+     *
+     * So seek FORWARD by count first: that returns start+count, which gives us
+     * the start position AND leaves the descriptor exactly where a full read
+     * should leave it. Only a short read (EOF) needs a correcting seek, and
+     * from io.log that is about one read in a hundred.
+     *
+     * Safe on this target: fsdev_seek() rejects only offsets before the start
+     * of the file; past EOF it just stores the offset and returns it, with no
+     * IPC and no size query. The descriptor still owns the position, so dup,
+     * __read_chk and fdopen stay correct -- that reasoning is unchanged. */
+    const long end = lseek(fd, (long)count, SEEK_CUR);
+    if (end >= (long)count) {
+      const long real = end - (long)count;
+      if (out_pos) *out_pos = real;
+      size_t done = 0;
+      const long avail = (rbase + rlen) - real;
+      if (avail > 0) {
+        done = (count < (size_t)avail) ? count : (size_t)avail;
+        memcpy(buf, rbuf + (real - rbase), done);   /* immutable: see below */
+      }
+      const long endpos = real + (long)done;
+      mutexLock(&g_ra_lock);
+      c->pos = endpos;
+      g_bytes_from_ram += done;
+      mutexUnlock(&g_ra_lock);
+      if (endpos != end) lseek(fd, endpos, SEEK_SET);   /* short read only */
+      return (long)done;
+    }
+    if (end >= 0) lseek(fd, end - (long)count, SEEK_SET);   /* undo before falling through */
+  }
+#endif
+
+  /* THE RESIDENT COPY RUNS WITHOUT THE LOCK, AND THAT IS ONLY TRUE NOW.
+   *
+   * g_ra_lock used to be held across the memcpy. Unity reads bundles from
+   * sixteen Background Job workers at once, so every read of every cached
+   * bundle queued on one mutex and parallel bundle loading became serial.
+   *
+   * It was not safe to copy outside the lock under the old per-file blob
+   * store: three paths could free the buffer while a slot still pointed at it.
+   * With the single immutable image it is. Once fb_load_now commits an entry,
+   * its bytes never change and are never freed for the life of the process,
+   * and the refill branch below is skipped for resident slots.
+   *
+   * The WINDOW path below is unchanged and still copies under the lock -- its
+   * c->buf is per-slot scratch the refill genuinely rewrites. */
   size_t done = 0;
   const long real = lseek(fd, 0, SEEK_CUR);
+  if (out_pos) *out_pos = real;
   if (real < 0) return read(fd, buf, count);   /* cannot sync: do not serve */
+
   mutexLock(&g_ra_lock);
   c->pos = real;
   while (done < count) {
@@ -3704,14 +3791,22 @@ long read_fake(int fd, void *buf, size_t count) {
   if (fakefd_is_fake(fd)) return fakefd_read(fd, buf, count);
   { struct RaCache *c = ra_find(fd);
     if (c) {
-      const long real_before = lseek(fd, 0, SEEK_CUR);   /* for the SHORT READ line only */
+      long real_before = -1;            /* ra_read_at reports it; no second lseek */
+#if DEBUG_LOG
       /* Timing experiment -- see config.h ram_delay_ms. Resident only, first
        * read after open only, so the cost is one sleep per bundle open. */
       if (bp_ram_delay_ms > 0 && c->resident) {
         struct TrEntry *t0 = tr_by_fd(fd);
         if (t0 && t0->reads_this_open == 0) svcSleepThread((u64)bp_ram_delay_ms * 1000000ull);
       }
-      const long got = ra_read(c, fd, buf, count);
+#endif
+      const long got = ra_read_at(c, fd, buf, count, &real_before);
+#if DEBUG_LOG
+      /* PER-READ BOOKKEEPING, DEBUG BUILDS ONLY. tr_by_fd() is a linear scan of
+       * up to 96 entries, and every counter below feeds a line debugPrintf
+       * cannot emit at DEBUG_LOG 0 -- so in a release build this was up to 96
+       * comparisons plus the counter work on every read, producing numbers
+       * nothing would ever print. */
       struct TrEntry *te = tr_by_fd(fd);
       if (te) {
         te->reads++; te->reads_this_open++;
@@ -3768,6 +3863,9 @@ long read_fake(int fd, void *buf, size_t count) {
                  te->key, fd, count, got, c->pos, c->resident ? "(RAM)" : "(card)");
         }
       }
+#else
+      (void)real_before;
+#endif
       return got;
     } }
   /* fsdev can return fewer bytes than requested for a large read; il2cpp's
