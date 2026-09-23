@@ -100,12 +100,90 @@ long  __read_chk_fake(int fd, void *buf, size_t count, size_t buflen) {
   (void)buflen;
   return read_fake(fd, buf, count);
 }
-long  __pread_chk_fake(int fd, void *buf, size_t count, long off, size_t buflen) {
+/* ======================================================= descriptor guard ===
+ * A file must not be closed while another thread is still inside a call on it.
+ *
+ * newlib cannot survive that. Confirmed in the 1.1.8 binary: __get_handle()
+ * takes __hndl_lock, loads handles[fd], RELEASES the lock and returns the raw
+ * pointer -- no reference taken -- and close() -> __release_handle() takes the
+ * same lock and frees the struct. A thread between those two points reads a
+ * freed handle. On Android the same race is a harmless EBADF; here it is the
+ * 1.1.8 crash: _lseek_r loaded devoptab_list[handle->device] from a freed
+ * handle, got NULL, and faulted reading ->seek_r at +0x30.
+ *
+ * One atomic word per descriptor: the number of calls in flight, plus a CLOSING
+ * bit. A call adds itself and tests the bit in ONE atomic step, so there is no
+ * gap between "is it closing?" and "I am using it". close_fake() sets CLOSING,
+ * waits for the count to drain, closes, clears CLOSING.
+ *
+ *  - close waits FIRST, holding no lock: close_fake() goes on to take the RAM
+ *    cache's locks (ra_detach), and a read in flight needs those to finish.
+ *  - A call that finds CLOSING set backs off and RETRIES rather than failing:
+ *    once newlib has freed descriptor N another thread may reopen N before the
+ *    bit is cleared, and failing that new file's first read would be a false
+ *    error. If the bit stays set it gives up with EBADF -- the file is going.
+ *  - Every wait is bounded. A call that never returns (a blocking socket read)
+ *    cannot hang close forever; past the bound close proceeds exactly as it did
+ *    before this existed, and says so once.
+ *
+ * FDG_MAX is newlib's own limit: __get_handle rejects fd > 0x3ff. The network
+ * shim's socket pairs live at 0x40000000+ under their own lock, so a number
+ * outside the table is simply not guarded. Guarded: read, write, lseek, fstat,
+ * mmap, pread, pwrite, writev and __pread_chk (__read_chk goes through read). */
+#define FDG_MAX            1024u
+#define FDG_CLOSING        0x80000000u
+#define FDG_ENTER_TRIES    500          /* x 100 us = 50 ms waiting for a close to finish */
+#define FDG_CLOSE_TRIES    30000        /* x 100 us = 3 s waiting for calls to drain      */
+static volatile uint32_t g_fdg[FDG_MAX];
+static volatile uint32_t g_fdg_close_timeouts, g_fdg_enter_refused;
+
+int fdg_enter(int fd) {
+  if ((unsigned)fd >= FDG_MAX) return 1;
+  for (int t = 0; ; t++) {
+    const uint32_t s = __atomic_add_fetch(&g_fdg[fd], 1, __ATOMIC_SEQ_CST);
+    if (!(s & FDG_CLOSING)) return 1;
+    __atomic_sub_fetch(&g_fdg[fd], 1, __ATOMIC_SEQ_CST);
+    if (t >= FDG_ENTER_TRIES) {
+      __atomic_add_fetch(&g_fdg_enter_refused, 1, __ATOMIC_RELAXED);
+      errno = EBADF;
+      return 0;
+    }
+    svcSleepThread(100000ull);
+  }
+}
+void fdg_leave(int fd) {
+  if ((unsigned)fd < FDG_MAX) __atomic_sub_fetch(&g_fdg[fd], 1, __ATOMIC_SEQ_CST);
+}
+static void fdg_close_begin(int fd) {
+  if ((unsigned)fd >= FDG_MAX) return;
+  __atomic_or_fetch(&g_fdg[fd], FDG_CLOSING, __ATOMIC_SEQ_CST);
+  for (int t = 0; (__atomic_load_n(&g_fdg[fd], __ATOMIC_SEQ_CST) & ~FDG_CLOSING) != 0; t++) {
+    if (t >= FDG_CLOSE_TRIES) {
+      if (__atomic_add_fetch(&g_fdg_close_timeouts, 1, __ATOMIC_RELAXED) == 1)
+        debugPrintf("[io] close(fd=%d) waited 3 s for %u call(s) still inside it and "
+                    "closed anyway -- the old unguarded behaviour, for this one close\n",
+                    fd, __atomic_load_n(&g_fdg[fd], __ATOMIC_SEQ_CST) & ~FDG_CLOSING);
+      return;
+    }
+    svcSleepThread(100000ull);
+  }
+}
+static void fdg_close_end(int fd) {
+  if ((unsigned)fd < FDG_MAX) __atomic_and_fetch(&g_fdg[fd], ~FDG_CLOSING, __ATOMIC_SEQ_CST);
+}
+
+long  __pread_chk_fake_unguarded(int fd, void *buf, size_t count, long off, size_t buflen) {
   (void)buflen;
   long cur = lseek(fd, 0, SEEK_CUR);
   if (cur < 0 || lseek(fd, off, SEEK_SET) < 0) return -1;
   long r = read(fd, buf, count);
   lseek(fd, cur, SEEK_SET);
+  return r;
+}
+long  __pread_chk_fake(int fd, void *buf, size_t count, long off, size_t buflen) {
+  if (!fdg_enter(fd)) return -1;
+  long r = __pread_chk_fake_unguarded(fd, buf, count, off, buflen);
+  fdg_leave(fd);
   return r;
 }
 void  __FD_SET_chk_fake(int fd, void *set, size_t setlen) { (void)setlen; if (set && fd >= 0 && fd < 1024) ((unsigned long *)set)[fd / (8 * sizeof(long))] |= (1ul << (fd % (8 * sizeof(long)))); }
@@ -2084,7 +2162,7 @@ static long ra_read_at(struct RaCache *c, int fd, void *buf, size_t count, long 
  * lseek64 was previously stubbed to return 0 (no seek) -- that made libunity's
  * archive reader see data.unity3d as empty/mis-positioned ("Unable to read
  * header from archive file"), since it lseek64(SEEK_END)s to size the file. */
-long z_lseek(int fd, long off, int whence) {
+long z_lseek_unguarded(int fd, long off, int whence) {
   /* Pack fds live outside the real fd space and carry their own position,
    * so they must be answered before ra_find() looks them up. */
   if (asset_pack_fd_is(fd)) return asset_pack_lseek_fd(fd, off, whence);
@@ -2116,6 +2194,12 @@ long z_lseek(int fd, long off, int whence) {
     struct TrEntry *te = tr_by_fd(fd);
     if (te) { te->lseeks++; tr_op(te, 's', -1, off, np, whence, 2); }
     return np; }
+}
+long z_lseek(int fd, long off, int whence) {
+  if (!fdg_enter(fd)) return -1;
+  long r = z_lseek_unguarded(fd, off, whence);
+  fdg_leave(fd);
+  return r;
 }
 
 static const char *synthetic_proc(const char *path);  /* defined below */
@@ -2700,7 +2784,7 @@ int stat_fake(const char *path, struct bionic_stat *st) {
   }
   return r;
 }
-int fstat_fake(int fd, struct bionic_stat *st) {
+int fstat_fake_unguarded(int fd, struct bionic_stat *st) {
   {
     uint64_t psz, pino; int pdir;
     if (asset_pack_fstat_fd(fd, &psz, &pino, &pdir)) {
@@ -2737,6 +2821,12 @@ int fstat_fake(int fd, struct bionic_stat *st) {
                       te->key, fd, (long)real.st_size); }
       } }
   }
+  return r;
+}
+int fstat_fake(int fd, struct bionic_stat *st) {
+  if (!fdg_enter(fd)) return -1;
+  int r = fstat_fake_unguarded(fd, st);
+  fdg_leave(fd);
   return r;
 }
 int lstat_fake(const char *path, struct bionic_stat *st) { return stat_fake(path, st); }
@@ -3226,6 +3316,16 @@ static void *mmap_arena_alloc_locked(size_t len, size_t *got) {
   return NULL;
 }
 
+/* Does Unity ever give arena space back? "now" has equalled "peak" in every
+ * [mem] sample ever taken, which means the arena only ever grows. Either Unity
+ * does not munmap these maps, or munmap is not reaching here. Counting both
+ * separates those two, and they need completely different fixes. */
+static size_t g_arena_freed_b; static unsigned g_arena_free_n, g_munmap_n;
+void bp_munmap_stats(size_t *freed, unsigned *arena_calls, unsigned *all_calls) {
+  if (freed)       *freed       = g_arena_freed_b;
+  if (arena_calls) *arena_calls = g_arena_free_n;
+  if (all_calls)   *all_calls   = g_munmap_n;
+}
 static void mmap_arena_free(void *addr, size_t len) {
   if (!mmap_arena || (uint8_t *)addr < mmap_arena) return;
   size_t off = (uint8_t *)addr - mmap_arena;
@@ -3233,6 +3333,7 @@ static void mmap_arena_free(void *addr, size_t len) {
   size_t first = off / MMAP_PAGE;
   size_t cnt   = (len + MMAP_PAGE - 1) / MMAP_PAGE;
   mutexLock(&g_mmap_lock);
+  g_arena_freed_b += len; g_arena_free_n++;       /* under the lock: were racy */
   for (size_t k = 0; k < cnt && first + k < mmap_pages; k++)
     mmap_used[first + k] = 0;
   mutexUnlock(&g_mmap_lock);
@@ -3245,13 +3346,48 @@ static void mmap_arena_free(void *addr, size_t len) {
 // sub-1MB il2cpp allocations that were failing and surfaces il2cpp's true mmap
 // appetite in the log to size the proper fix.
 #define MMAP_FALLBACK_MAX 4096
-static struct { void *ptr; size_t len; } g_fb[MMAP_FALLBACK_MAX];
+/* Each spilled map remembers which byte ranges Unity has already unmapped
+ * (offsets from ptr, sorted, merged). See mmap_fallback_free(). nrel < 0 means
+ * the pattern got too fragmented to track, so the chunk is simply kept whole --
+ * the old, safe behaviour. */
+#define FB_IV 4
+/* Return a released tail to the allocator at once, instead of when the whole
+ * map has been given back. Saves ~64 MB per long-lived spill. The cost: once
+ * returned, that range cannot be MAP_FIXED back, and the GC aborts if a fixed
+ * remap is refused. Nothing that trims a tail remaps it -- Unity never does,
+ * and the GC unmaps by remapping PROT_NONE and never calls munmap -- and a
+ * refusal is logged ("MAP_FIXED ... is not memory this shim owns"). If that
+ * line ever appears, set this to 0: interval tracking alone still fixes the
+ * leak, it just holds the tail until the block is released. */
+#define FB_SHRINK_TAILS 1
+typedef struct { uint32_t lo, hi; } FbRange;
+static struct { void *ptr; size_t len; int nrel; FbRange rel[FB_IV]; } g_fb[MMAP_FALLBACK_MAX];
 static int   g_fb_n = 0;
 static size_t g_fb_bytes = 0;
 static size_t g_arena_peak_pages;   /* high-water mark of reserved arena pages */
+
+/* UNITY'S COMMIT RATIO -- the one number nobody has measured.
+ *
+ * Every big map Unity asks for is PROT_NONE: address space it reserves and may
+ * never touch. It commits pieces later with mprotect(RW). On Horizon there is
+ * no reserve-without-commit, so the arena hands back real memory for all of it.
+ * If Unity only ever writes to a fraction, the rest is dead weight -- and the
+ * overcommit machinery in this file (oc_arena_init, arena_commit_locked,
+ * svcMapPhysicalMemory) exists to reclaim exactly that, but has never been
+ * armed because nobody knew whether the gap was 50 MB or 500.
+ *
+ * These count bytes mprotect()ed to RW versus back to PROT_NONE inside the
+ * arena, so rw - none is Unity's live committed footprint. Reported on the
+ * [mem] line next to the arena's reservation. */
+static size_t rw_b = 0, none_b = 0;
+static unsigned rw_n = 0, none_n = 0, oth_n = 0;
+void bp_mmap_commit_stats(size_t *committed, size_t *decommitted, unsigned *n) {
+  if (committed)   *committed   = rw_b;
+  if (decommitted) *decommitted = none_b;
+  if (n)           *n           = rw_n + none_n;
+}
 static size_t g_fb_leaked;          /* held by refused partial munmaps -- see mmap_fallback_free */
 /* For the [mem] breakdown: what the mmap arena and the fallback path hold. */
-size_t bp_mmap_leaked(void) { return g_fb_leaked; }
 void bp_mmap_stats(size_t *arena_reserved, size_t *arena_used, size_t *arena_peak, size_t *fallback) {
   size_t used = 0;
   if (mmap_used) for (size_t i = 0; i < mmap_pages; i++) used += mmap_used[i] ? 1 : 0;
@@ -3290,9 +3426,22 @@ static void *mmap_fallback(size_t length, int flags, int fd, long offset) {
     if ((size_t)got < length) memset((char *)q + got, 0, length - got);
   }
   mutexLock(&g_fb_lock);
-  if (g_fb_n < MMAP_FALLBACK_MAX) { g_fb[g_fb_n].ptr = q; g_fb[g_fb_n].len = length; g_fb_n++; g_fb_bytes += length; }
+  int tracked = 0;
+  if (g_fb_n < MMAP_FALLBACK_MAX) { g_fb[g_fb_n].ptr = q; g_fb[g_fb_n].len = length; g_fb[g_fb_n].nrel = 0; g_fb_n++; g_fb_bytes += length; tracked = 1; }
   const size_t total = g_fb_bytes;
   mutexUnlock(&g_fb_lock);
+  /* An untracked map can never be freed: munmap finds it in neither the
+   * registry nor the arena and does nothing. The old code handed it out anyway,
+   * silently, and left it out of the [mem] fallback figure. Refuse instead --
+   * an honest ENOMEM beats a leak nobody can see. */
+  if (!tracked) {
+    free(q);
+    static int told;
+    if (!told) { told = 1;
+      debugPrintf("[mmap] fallback registry full (%d entries) -- refusing rather than "
+                  "leaking an untracked %zu KB map\n", MMAP_FALLBACK_MAX, length >> 10); }
+    return NULL;
+  }
   if (TRACE_MMAP) debugPrintf("[mmap] fallback %u KB -> %p  anon=%d fd=%d off=0x%lx got=%ld (total %u MB)\n",
               (unsigned)(length >> 10), q, !!(flags & BIONIC_MAP_ANONYMOUS), fd, offset, got,
               (unsigned)(total >> 20));
@@ -3300,42 +3449,134 @@ static void *mmap_fallback(size_t length, int flags, int fd, long offset) {
 }
 
 // returns 1 and frees if addr was a fallback allocation
+/* Record [lo, hi) as given back. Returns 1 once the whole chunk is covered.
+ * Touching ranges merge, so a head trim plus a tail trim plus the release of
+ * the kept block in the middle collapse to [0, len). Called under g_fb_lock. */
+static int fb_add_release(int i, size_t lo, size_t hi) {
+  if (g_fb[i].nrel < 0) return 0;
+  if (g_fb[i].len > UINT32_MAX || hi <= lo) { g_fb[i].nrel = -1; return 0; }
+  uint64_t L = lo, H = hi;
+  FbRange out[FB_IV + 1]; int m = 0, placed = 0;
+  for (int k = 0; k < g_fb[i].nrel; k++) {
+    const FbRange r = g_fb[i].rel[k];
+    if (r.hi < L)            out[m++] = r;                 /* wholly before */
+    else if (r.lo > H) {                                   /* wholly after  */
+      if (!placed) { out[m].lo = (uint32_t)L; out[m].hi = (uint32_t)H; m++; placed = 1; }
+      out[m++] = r;
+    } else { if (r.lo < L) L = r.lo; if (r.hi > H) H = r.hi; }   /* overlap or touch: merge */
+    if (m > FB_IV) break;
+  }
+  if (!placed && m <= FB_IV) { out[m].lo = (uint32_t)L; out[m].hi = (uint32_t)H; m++; }
+  if (m > FB_IV) { g_fb[i].nrel = -1; return 0; }          /* too fragmented: keep whole */
+  memcpy(g_fb[i].rel, out, (size_t)m * sizeof out[0]);
+  g_fb[i].nrel = m;
+  return m == 1 && g_fb[i].rel[0].lo == 0 && g_fb[i].rel[0].hi >= g_fb[i].len;
+}
+static void fb_drop(int i) {                               /* under g_fb_lock */
+  free(g_fb[i].ptr);
+  g_fb_bytes -= g_fb[i].len;
+  g_fb[i] = g_fb[--g_fb_n];
+}
+
+/* UNMAPPING PART OF A SPILLED MAP.
+ *
+ * Unity reserves 128 MB - 4 KB, rounds up to the next 64 MB boundary, keeps
+ * 64 MB from there and unmaps the rest; later it unmaps the 64 MB it kept. So
+ * over its life every byte of a spilled map is given back -- in two or three
+ * pieces, none of which is the whole map at its base.
+ *
+ * This used to accept only "base address, whole length". A tail trim at
+ * base + 64 MB matched no entry and was ignored in silence; the release of the
+ * kept block at the base was refused as "partial". Unity gave back all 128 MB
+ * and the port freed none of it. On the 1.1.6 crash, Unity reserved and
+ * released five in a burst at frame 1080 and they came back at 0x79c0..,
+ * 0x79c8.., 0x79d0.., 0x79d8.., 0x79e0.. -- each 128 MB above the last,
+ * because the previous one was never freed. That burst is what ran the heap
+ * out, and the 64 MB NULL that crashed Unity was the next request.
+ *
+ * Refusing partial unmaps was not wrong: an earlier version freed the whole
+ * chunk on one, while Unity still used the rest, and handed live memory to the
+ * next malloc. So nothing here frees early. Released ranges are RECORDED, and
+ * the chunk is freed only when every byte has been given back. The one
+ * exception returns memory sooner without freeing anything in use: when the
+ * TAIL is released and the front is not, the chunk is shrunk in place with
+ * realloc. Both newlib allocators keep the pointer on a shrink (dlmalloc splits
+ * the chunk, nano-malloc returns it as is), which is checked anyway, and GPU
+ * arena chunks are left alone because their realloc path moves the block. */
 static int mmap_fallback_free(void *addr, size_t length) {
+  uint8_t *a = (uint8_t *)addr;
+  /* A zero length is an error that unmaps NOTHING (POSIX: EINVAL). This used to
+   * mean "to the end": munmap(base, 0) freed the whole map (inherited), and
+   * munmap(inside, 0) would have recorded [inside, end) as released -- and the
+   * tail shrink would then have handed memory Unity still holds back to the
+   * allocator. Found in the audit of 1.1.7, before it ever ran. */
+  if (!length) return 0;
+  /* A range that runs off the top of the address space is also EINVAL and
+   * unmaps nothing. Clamping it to the end of the map instead would release
+   * bytes the caller never asked to release. */
+  if (length > UINTPTR_MAX - (uintptr_t)addr) return 0;
   mutexLock(&g_fb_lock);
   for (int i = 0; i < g_fb_n; i++) {
-    if (g_fb[i].ptr == addr) {
-      /* THE LENGTH MATTERS. This freed the whole chunk on a pointer match and
-       * never looked at length, so an engine allocator trimming the HEAD of a
-       * reservation -- munmap(base, first_n_pages) -- freed the entire
-       * mapping while the engine kept using the rest, and the allocator handed
-       * that memory to whoever malloc'd next. A partial unmap is refused here
-       * and logged: a bounded leak beats a use-after-free that surfaces as
-       * zeros in someone else's buffer. */
-      if (length && length < g_fb[i].len) {
-        const size_t whole = g_fb[i].len;
-        /* Unity over-maps and trims: it asks for 128 MB to get an aligned
-         * 64 MB block, then munmaps the half it does not want. We cannot
-         * return part of a malloc chunk, so the trimmed half is HELD -- every
-         * fallback map costs double. Counted here so the [mem] line shows it;
-         * the real fix is an mmap arena large enough that this path is never
-         * taken, which is what mmap_arena_mb is now sized for. */
-        g_fb_leaked += length;
-        mutexUnlock(&g_fb_lock);                /* log OUTSIDE the lock */
-        static unsigned told;
-        if (told < 8) { told++;
-          debugPrintf("[mmap] PARTIAL munmap(%p, %zu) of a %zu-byte fallback map -- "
-                      "refused (kept whole)\n", addr, length, whole); }
-        return 1;
-      }
-      free(addr);
-      g_fb_bytes -= g_fb[i].len;
-      g_fb[i] = g_fb[--g_fb_n];
+    uint8_t *p = (uint8_t *)g_fb[i].ptr;
+    const size_t n = g_fb[i].len;
+    if (a < p || a >= p + n) continue;
+    if (a == p && length >= n) {                           /* the whole map at once */
+      fb_drop(i);
       mutexUnlock(&g_fb_lock);
       return 1;
     }
+    const size_t lo = (size_t)(a - p);
+    const size_t hi = (length > n - lo) ? n : lo + length;   /* no wrap on a huge length */
+    if (fb_add_release(i, lo, hi)) {                       /* last piece given back */
+      fb_drop(i);
+      mutexUnlock(&g_fb_lock);
+      static unsigned told;
+      if (told < 4) { told++;
+        debugPrintf("[mmap] spilled map %p fully given back in pieces -- freed %zu MB\n",
+                    (void *)p, n >> 20); }
+      return 1;
+    }
+    /* Tail given back while the front is still in use: return it now. */
+    size_t shrunk = 0;
+    if (FB_SHRINK_TAILS && g_fb[i].nrel > 0) {
+      const FbRange last = g_fb[i].rel[g_fb[i].nrel - 1];
+      extern int bp_gpua_owns(const void *);
+      if (last.hi >= n && last.lo > 0 && !bp_gpua_owns(p)) {
+        void *q = realloc(p, last.lo);
+        if (q == p) {
+          shrunk = n - last.lo;
+          g_fb[i].len = last.lo;
+          g_fb[i].nrel--;
+          g_fb_bytes -= shrunk;
+        } else if (q) {
+          /* Cannot happen with either newlib allocator. If it ever does, the
+           * block Unity holds has moved; say so as loudly as possible. */
+          debugPrintf("[mmap] *** realloc MOVED a spilled map (%p -> %p) -- Unity's "
+                      "pointer is now stale ***\n", (void *)p, q);
+        }
+      }
+    }
+    mutexUnlock(&g_fb_lock);
+    if (shrunk) {
+      static unsigned told2;
+      if (told2 < 4) { told2++;
+        debugPrintf("[mmap] tail of spilled map %p given back -- shrunk in place, %zu MB "
+                    "returned now\n", (void *)p, shrunk >> 20); }
+    }
+    return 1;
   }
   mutexUnlock(&g_fb_lock);
   return 0;
+}
+
+size_t bp_mmap_leaked(void) {          /* given back by Unity, not yet freed */
+  size_t held = 0;
+  mutexLock(&g_fb_lock);
+  for (int i = 0; i < g_fb_n; i++)
+    for (int k = 0; k < g_fb[i].nrel; k++) held += g_fb[i].rel[k].hi - g_fb[i].rel[k].lo;
+  mutexUnlock(&g_fb_lock);
+  (void)g_fb_leaked;
+  return held;
 }
 
 // ---- read-only file-map dedup cache ---------------------------------------
@@ -3358,10 +3599,17 @@ static void *mapcache_get(uint64_t ino, long off, size_t len) {
 }
 static void mapcache_put(uint64_t ino, long off, size_t len, void *ptr) {
   mutexLock(&g_fb_lock);
-  for (int i = 0; i < g_fb_n; i++)          // pin: drop from fallback free-list
-    if (g_fb[i].ptr == ptr) { g_fb_bytes -= g_fb[i].len; g_fb[i] = g_fb[--g_fb_n]; break; }
-  if (g_mapc_n < MAPC_N) { g_mapc[g_mapc_n].ino = ino; g_mapc[g_mapc_n].off = off;
-                           g_mapc[g_mapc_n].len = len; g_mapc[g_mapc_n].ptr = ptr; g_mapc_n++; }
+  /* Pin ONLY if it can actually be cached. This used to drop the pointer from
+   * the fallback list first and check for room second -- so with the cache
+   * full (MAPC_N entries) the map was neither freeable by munmap nor findable
+   * by mapcache_get: leaked for the life of the process, on every read-only
+   * file map past the 24th. Left in the fallback list it stays freeable. */
+  if (g_mapc_n < MAPC_N) {
+    for (int i = 0; i < g_fb_n; i++)
+      if (g_fb[i].ptr == ptr) { g_fb_bytes -= g_fb[i].len; g_fb[i] = g_fb[--g_fb_n]; break; }
+    g_mapc[g_mapc_n].ino = ino; g_mapc[g_mapc_n].off = off;
+    g_mapc[g_mapc_n].len = len; g_mapc[g_mapc_n].ptr = ptr; g_mapc_n++;
+  }
   mutexUnlock(&g_fb_lock);
 }
 
@@ -3378,8 +3626,14 @@ static void mapcache_put(uint64_t ino, long off, size_t len, void *ptr) {
  * hands out, so PROT_NONE releases physical and RW commits + zeroes. */
 static void *mmap_fixed_anon(void *addr, size_t len, int prot) {
   uint8_t *a = (uint8_t *)addr;
-  const int in_arena = g_mmap_arena_base && a >= (uint8_t *)g_mmap_arena_base &&
-                       a + len <= (uint8_t *)g_mmap_arena_base + g_mmap_arena_size;
+  /* mmap_arena / mmap_usable, NOT g_mmap_arena_base. That symbol is set to NULL
+   * in main.c and never assigned -- it is the hook for a dedicated arena that
+   * __libnx_initheap does not provide -- so this test was ALWAYS FALSE and the
+   * branch below was dead. Boehm's MAP_FIXED remaps inside the arena therefore
+   * fell through to the ownership check and were refused, and the comment above
+   * records what Boehm does when it does not get `start` back: it aborts. */
+  const int in_arena = mmap_arena && a >= mmap_arena &&
+                       a + len <= mmap_arena + mmap_usable;
   if (in_arena) {
     if (prot == BIONIC_PROT_NONE) { if (g_overcommit) arena_decommit_range(addr, len); }
     else { if (g_overcommit) arena_commit_range(addr, len); memset(addr, 0, len); }
@@ -3403,7 +3657,17 @@ static void *mmap_fixed_anon(void *addr, size_t len, int prot) {
   { int owned = 0;
     mutexLock(&g_fb_lock);
     for (int i = 0; i < g_fb_n && !owned; i++)
-      if (a >= (uint8_t *)g_fb[i].ptr && a + len <= (uint8_t *)g_fb[i].ptr + g_fb[i].len) owned = 1;
+      if (a >= (uint8_t *)g_fb[i].ptr && a + len <= (uint8_t *)g_fb[i].ptr + g_fb[i].len) {
+        owned = 1;
+        /* A fixed remap makes its range LIVE again. If part of it had been
+         * unmapped earlier, the release record for this spill is now wrong, and
+         * trusting it would free the chunk while this range is in use. Stop
+         * tracking it piecewise: it goes back to the old rule, freed only by a
+         * whole-map unmap -- a possible leak, never a use-after-free. */
+        const size_t off = (size_t)(a - (uint8_t *)g_fb[i].ptr);
+        for (int k = 0; k < g_fb[i].nrel; k++)
+          if (g_fb[i].rel[k].lo < off + len && off < g_fb[i].rel[k].hi) { g_fb[i].nrel = -1; break; }
+      }
     for (int i = 0; i < g_mapc_n && !owned; i++)
       if (a >= (uint8_t *)g_mapc[i].ptr && a + len <= (uint8_t *)g_mapc[i].ptr + g_mapc[i].len) owned = 1;
     mutexUnlock(&g_fb_lock);
@@ -3412,7 +3676,7 @@ static void *mmap_fixed_anon(void *addr, size_t len, int prot) {
   return NULL;
 }
 
-void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long offset) {
+void *mmap_fake_unguarded(void *addr, size_t length, int prot, int flags, int fd, long offset) {
   if (length == 0) length = 1;
   if ((flags & BIONIC_MAP_FIXED) && addr && (flags & BIONIC_MAP_ANONYMOUS)) {
     static int told;
@@ -3463,9 +3727,13 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
    * RAM. For global-metadata.dat that nulls out System.Object (Class::Init NULL).
    * Hand any short-reserved file map to newlib, which backs the whole length. */
   if (p && !(flags & BIONIC_MAP_ANONYMOUS) && fd >= 0 && reserved < length) {
-    mutexLock(&g_mmap_lock);
+    /* NO outer lock: mmap_arena_free() takes g_mmap_lock itself, and libnx's
+     * Mutex is not recursive. The old code locked it here first, so this branch
+     * -- a file map the arena could only half-fit -- blocked forever holding the
+     * lock, and every later mmap/munmap/mprotect on any thread blocked behind
+     * it. A whole-game freeze with no crash report, on a rare branch: exactly
+     * what "the game hangs sometimes" looks like. tools/relock.py finds these. */
     mmap_arena_free(p, length);
-    mutexUnlock(&g_mmap_lock);
     if (TRACE_MMAP) debugPrintf("[mmap] file fd=%d len=%zu: arena tail-overflow (reserved=%zu) -> newlib\n",
                 fd, length, reserved);
     p = NULL;
@@ -3530,8 +3798,15 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
   }
   return p;
 }
+void * mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long offset) {
+  if (!fdg_enter(fd)) return (void *)-1;
+  void * r = mmap_fake_unguarded(addr, length, prot, flags, fd, offset);
+  fdg_leave(fd);
+  return r;
+}
 
 int munmap_fake(void *addr, size_t length) {
+  g_munmap_n++;
   if (mmap_fallback_free(addr, length)) return 0;   // newlib fallback allocation
   if (oc_contains(addr)) {                   // stack-region OC reservation
     mutexLock(&g_mmap_lock);
@@ -3553,11 +3828,8 @@ int mprotect_fake(void *addr, size_t len, int prot) {
    * overcommit commit-pool. Tracks cumulative RW-commit vs PROT_NONE-decommit
    * bytes that fall inside the mmap arena (= Unity's live committed footprint). */
   {
-    static size_t rw_b = 0, none_b = 0;
-    static unsigned rw_n = 0, none_n = 0, oth_n = 0;
-    int in_arena = g_mmap_arena_base &&
-                   (uint8_t *)addr >= (uint8_t *)g_mmap_arena_base &&
-                   (uint8_t *)addr <  (uint8_t *)g_mmap_arena_base + g_mmap_arena_size;
+    int in_arena = mmap_arena && (uint8_t *)addr >= mmap_arena &&
+                   (uint8_t *)addr <  mmap_arena + mmap_usable;
     if (prot == BIONIC_PROT_NONE)       { none_n++; if (in_arena) none_b += len; }
     else if (prot & BIONIC_PROT_WRITE)  { rw_n++;   if (in_arena) rw_b   += len; }
     else                                  oth_n++;
@@ -3782,7 +4054,7 @@ int vfprintf_fake(FILE *f, const char *fmt, va_list va) {
 // (android_native.c). Real files (small fds from open()) pass through to newlib.
 // ---------------------------------------------------------------------------
 
-long read_fake(int fd, void *buf, size_t count) {
+long read_fake_unguarded(int fd, void *buf, size_t count) {
   /* Any read the game makes defers the prefetch. Marking only cached reads
    * would miss the uncached majority -- which is most of what it does while
    * loading, and exactly when the card must be left alone. */
@@ -3893,7 +4165,13 @@ long read_fake(int fd, void *buf, size_t count) {
   watch_dump("read", fd, (long)count, 0, buf, (long)total);
   return (long)total;
 }
-long write_fake(int fd, const void *buf, size_t count) {
+long read_fake(int fd, void *buf, size_t count) {
+  if (!fdg_enter(fd)) return -1;
+  long r = read_fake_unguarded(fd, buf, count);
+  fdg_leave(fd);
+  return r;
+}
+long write_fake_unguarded(int fd, const void *buf, size_t count) {
   if (fakefd_is_fake(fd)) return fakefd_write(fd, buf, count);
   dlw_wrote(fd, (long)count);
   /* stdout/stderr go nowhere on Switch. Boehm writes its ABORT text to stderr
@@ -3908,7 +4186,13 @@ long write_fake(int fd, const void *buf, size_t count) {
   }
   return write(fd, buf, count);
 }
-int close_fake(int fd) {
+long write_fake(int fd, const void *buf, size_t count) {
+  if (!fdg_enter(fd)) return -1;
+  long r = write_fake_unguarded(fd, buf, count);
+  fdg_leave(fd);
+  return r;
+}
+static int close_fake_unguarded(int fd) {
   if (asset_pack_fd_is(fd)) return asset_pack_close_fd(fd);
   { struct TrEntry *te = tr_by_fd(fd);
     if (te) {
@@ -3938,6 +4222,12 @@ int close_fake(int fd) {
   if (fakefd_is_fake(fd)) return fakefd_close(fd);
   int r = close(fd);
   commit_write_fd(fd);   /* flush a just-written save to the physical SD */
+  return r;
+}
+int close_fake(int fd) {
+  fdg_close_begin(fd);          /* FIRST, holding nothing -- see the descriptor guard */
+  int r = close_fake_unguarded(fd);
+  fdg_close_end(fd);
   return r;
 }
 int pipe_fake(int fds[2]) { return fakefd_pipe(fds); }
@@ -4137,6 +4427,11 @@ void *dlsym_fake(void *handle, const char *symbol) {
 typedef struct { RwLock lock; } FakeRwLock;
 
 static FakeRwLock *get_rwlock(void **storage) {
+  /* Unchecked on purpose. Every caller dereferences the result at once
+   * (&get_rwlock(rw)->lock) and a rdlock/wrlock has no way to report failure
+   * the game would act on, so there is no honest value to return. A ~16 byte
+   * calloc failing means the heap is already exhausted and the process is
+   * going down regardless. See HANDOFF: "unchecked, by decision". */
   if (!*storage) { FakeRwLock *l = calloc(1, sizeof(*l)); rwlockInit(&l->lock); *storage = l; }
   return *storage;
 }
@@ -4154,7 +4449,7 @@ int pthread_rwlock_unlock_fake(void **rw) {
 }
 
 typedef struct { Semaphore sem; } FakeSem;
-int sem_init_fake(void **s, int pshared, unsigned int value) { (void)pshared; FakeSem *fs = calloc(1, sizeof(*fs)); semaphoreInit(&fs->sem, value); *s = fs; return 0; }
+int sem_init_fake(void **s, int pshared, unsigned int value) { (void)pshared; FakeSem *fs = calloc(1, sizeof(*fs)); if (!fs) { errno = ENOMEM; return -1; } semaphoreInit(&fs->sem, value); *s = fs; return 0; }
 int sem_destroy_fake(void **s) { if (s && *s) { free(*s); *s = NULL; } return 0; }
 int sem_post_fake(void **s) { if (s && *s) semaphoreSignal(&((FakeSem *)*s)->sem); return 0; }
 int sem_wait_fake(void **s) { if (s && *s) { Semaphore *sm=&((FakeSem *)*s)->sem; diag_wait_enter(DIAG_W_SEM,sm); semaphoreWait(sm); diag_wait_exit(); } return 0; }

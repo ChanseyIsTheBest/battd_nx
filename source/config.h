@@ -26,6 +26,14 @@
  * Turn it back to 1 before reporting a problem. It is the only instrument this
  * port has, and every diagnosis in PORTING.md came out of it. */
 #define DEBUG_LOG        0
+
+/* CRASH_DUMP is deliberately NOT tied to DEBUG_LOG.
+ *
+ * A release build wants no debug.log and no per-frame instruments, but it
+ * still wants a crash report -- "it crashed and there is nothing to read" is
+ * the worst possible state to ship, and it is the state a DEBUG_LOG 0 build
+ * was in. crash.log costs nothing until a thread actually faults. */
+#define CRASH_DUMP       0
 #define DEBUG_JNI_TRACE  0
 #define TRACE_IO         0
 #define TRACE_MMAP       0
@@ -207,25 +215,67 @@ extern int bp_ram_skip_tail;
  * the game loads its largest scene. */
 extern int bp_diag_io;
 
-/* config.txt "mmap_arena_mb": the anonymous-mmap arena carved from the heap
- * at first use (default 768). Unity's 512 MB Dynamic Heap lives in it; the
- * rest is headroom for its other big maps. The [mem] line reports the arena's
- * high-water mark so this can be sized to what the game actually uses. */
+/* config.txt "mmap_arena_mb": the anonymous-mmap arena carved from the heap at
+ * first use (default 1408).
+ *
+ * BIGGER IS NOT BETTER, and the measurements say so plainly:
+ *
+ *     arena   fallback   total   outcome
+ *       640       1231    1871   ran 30300 frames
+ *      1280        292    1572   ran fine
+ *      1792        142    1934   memalign FAILED at frame 1140
+ *
+ * Two things make this counter-intuitive:
+ *
+ * 1. THE ARENA IS A RATCHET. "now" equals "peak" in every [mem] sample ever
+ *    taken -- it never releases a page. So it fills to whatever capacity it is
+ *    given, and the total is always arena + whatever still spills over. Giving
+ *    it more does not reduce Unity's demand, it just moves where the memory
+ *    sits and raises the total.
+ *
+ * 2. THE ARENA IS COMMITTED IN FULL, UP FRONT, at the first big mmap. The
+ *    fallback path grows on demand. So a large arena starves newlib of the
+ *    contiguous space the fallback needs -- and the fallback allocates
+ *    memalign(64 MB, 128 MB), which is the largest single request in the
+ *    process. At 1792 that memalign failed outright; the GPU arena's reserve
+ *    rescued one and the next one had nowhere to go.
+ *
+ * BUT THE PEAK IS NOT THE SAME EACH BOOT. Two consecutive boots of the same
+ * build doing the same thing (title screen -> level) asked for 16 and 17 maps
+ * and peaked at 1161 and 1212 MB. Whatever varies -- allocation order, address
+ * layout -- it moves the peak by ~50 MB, which is enough to cross a tight
+ * ceiling and start spilling. So leave a margin for the variance on top of the
+ * highest peak seen, rather than sizing to the best run.
+ *
+ * Size this to the minimum that keeps the spill small, not to Unity's total
+ * appetite. Watch "ARENA FULL" together with the [mem] fallback figure: a few
+ * spills are fine, a failed memalign is not. */
 extern int bp_mmap_arena_mb;
 
 /* config.txt "ram_max_file_mb": cache bundles larger than this stay on the
- * card (default 64). The point of residency is the small per-character
+ * card (default 16). The point of residency is the small per-character
  * bundles the game streams mid-play; shared_stuff at 118 MB is loaded once,
  * behind a loading screen, and holding it costs a sixth of what Unity has
  * left. 0 = no limit. */
 extern int bp_ram_max_file_mb;
 
 /* config.txt "gpu_arena_mb": the contiguous slab nouveau's 64KB..64MB buffers
- * come from (default 384). It was a hardcoded 512 sized by guesswork; the
- * [mem] line now reports the real peak, which measured 302 MB in a run that
- * reached the map. Floor is 96. Undersizing shows up as nouveau_bo_new
- * returning NULL -> GL_OUT_OF_MEMORY -> the compositor wedge this arena
- * exists to prevent, so leave margin over the measured peak. */
+ * come from (default 430 -- 90 MB, ~26%, over the measured peak).
+ *
+ * SIZE THIS FROM A LONG SESSION, NOT A SHORT ONE. The peak climbs with
+ * playtime: 302 MB at 21k frames, 340 MB at 30k, but only 191 MB in a run that
+ * stopped at 1.7k. Sizing against that short run gave 320, which is BELOW the
+ * real figure and would have wedged the compositor.
+ *
+ * Undersizing is not a degradation. nouveau_bo_new returns NULL, GL reports
+ * GL_OUT_OF_MEMORY, the framebuffer comes back incomplete and the console goes
+ * down -- a hard crash, no crash report. Overshooting just costs heap, and
+ * there is headroom. So this keeps a deliberately generous margin: 448 is
+ * ~32% over the measured 340.
+ *
+ * All of that was measured at 720p. A higher "resolution" makes every render
+ * target bigger, so raise this alongside it and watch the [mem] line's peak.
+ * Floor is 96. */
 extern int bp_gpu_arena_mb;
 
 /* ---- TLS ------------------------------------------------------------------
@@ -431,6 +481,18 @@ extern int bp_ram_cache_mb;      /* config.txt ram_cache, defaults to the above 
 #define BATTD_VIDEO_MAX_W 1280
 #define BATTD_VIDEO_MAX_H 720
 #define BATTD_VIDEO_DECODE_THREADS 2
+
+/* Skip H.264's deblocking filter and allow FFmpeg's non-bit-exact shortcuts
+ * (AV_CODEC_FLAG2_FAST) for the splash clips. Every clip is decoded at 1080p
+ * and scaled down to 720p, and the downscale smooths away exactly the block
+ * edges the filter exists to hide. Measured on the game's own clips (host
+ * decode + the same 720p scale, PSNR of the displayed frame vs a normal
+ * decode): 15-55% faster, 58-68 dB average, worst single frame 51.5 dB --
+ * visually identical; the error that builds up on reference frames is reset
+ * at each keyframe and stays small. The NK splash plays while Unity boots and
+ * has run as slow as 14.2 fps against 24. Set to 0 to restore a bit-exact
+ * decode. See tools/vbench.c. */
+#define BATTD_VIDEO_FAST_DECODE 1
 /* SplashScreenVideo drives the intro. The first attempt hooked PlayVideoNow;
  * the hardware log showed it never firing, because the real order is
  *

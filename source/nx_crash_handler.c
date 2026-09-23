@@ -49,6 +49,7 @@
  *                            don't want creport to also fire)
  * ==========================================================================*/
 
+#include "config.h"
 #include "libc_shim.h"
 #include "diag.h"
 #include <switch.h>

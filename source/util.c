@@ -187,7 +187,7 @@ static RawLog g_crashlog, g_wdlog, g_iolog;
 static FsFileSystem *g_rawfs;
 
 static void rawlog_init(RawLog *l, const char *name) {
-#if DEBUG_LOG
+#if DEBUG_LOG || CRASH_DUMP
   if (l->ok) return;
   if (!g_rawfs) g_rawfs = fsdevGetDeviceFileSystem("sdmc");
   if (!g_rawfs) { debugPrintf("[log] no sdmc filesystem for %s\n", name); return; }
@@ -208,7 +208,7 @@ static void rawlog_init(RawLog *l, const char *name) {
 }
 
 static int rawlog_write_raw(RawLog *l, const char *sbuf, size_t n) {
-#if DEBUG_LOG
+#if DEBUG_LOG || CRASH_DUMP
   if (!l->ok || !sbuf || !n) return 0;
   if (R_SUCCEEDED(fsFileWrite(&l->file, l->off, sbuf, n, FsWriteOption_Flush))) l->off += (s64)n;
   /* Commit per line ONLY for the crash log, where the handler can stop at any
@@ -224,7 +224,7 @@ static int rawlog_write_raw(RawLog *l, const char *sbuf, size_t n) {
 }
 
 static int rawlog_vprintf(RawLog *l, const char *fmt, va_list list) {
-#if DEBUG_LOG
+#if DEBUG_LOG || CRASH_DUMP
   if (!l->ok) return 0;
   const int n = vsnprintf(l->buf, sizeof l->buf, fmt, list);
   if (n <= 0) return 0;
@@ -236,7 +236,11 @@ static int rawlog_vprintf(RawLog *l, const char *fmt, va_list list) {
 #endif
 }
 
+#if CRASH_DUMP
 void crash_log_init(void) { rawlog_init(&g_crashlog, "crash.log"); }
+#else
+void crash_log_init(void) { }
+#endif
 void wd_log_init(void)    { rawlog_init(&g_wdlog,    "wd.log"); }
 void io_log_init(void)    { rawlog_init(&g_iolog,    "io.log"); }
 
@@ -247,9 +251,13 @@ int iolog_write(const char *sbuf, size_t n) { const int r = rawlog_write_raw(&g_
 void rawlog_commit(void) { if (g_rawfs) fsFsCommit(g_rawfs); }
 
 int crashPrintf(const char *fmt, ...) {
+#if !CRASH_DUMP
+  (void)fmt; return 0;
+#else
   va_list list; va_start(list, fmt);
   const int r = rawlog_vprintf(&g_crashlog, fmt, list);
   va_end(list); return r;
+#endif
 }
 int wdPrintf(const char *fmt, ...) {
   va_list list; va_start(list, fmt);

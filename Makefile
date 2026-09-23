@@ -42,7 +42,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET      := battd_nx
 APP_TITLE   := Bloons Adventure Time TD
 APP_AUTHOR  := ChanseyIsTheBest
-APP_VERSION := 1.0.1
+APP_VERSION := 1.0.3
 # Icon is OPTIONAL.
 #
 # $(wildcard) yields an empty string when the file is not there, and NROFLAGS

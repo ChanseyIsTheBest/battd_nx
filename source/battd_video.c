@@ -548,6 +548,10 @@ static void *decode_thread(void *ud) {
     avcodec_parameters_to_context(vdec, vp);
     vdec->thread_count = BATTD_VIDEO_DECODE_THREADS;
     vdec->thread_type  = FF_THREAD_FRAME;
+#if BATTD_VIDEO_FAST_DECODE
+    vdec->skip_loop_filter = AVDISCARD_ALL;       /* see config.h */
+    vdec->flags2 |= AV_CODEC_FLAG2_FAST;
+#endif
     if (avcodec_open2(vdec, vc, NULL) < 0) {
       debugPrintf("[video] avcodec_open2 failed for %s\n", vc->name);
       goto done;
@@ -568,9 +572,10 @@ static void *decode_thread(void *ud) {
       if (sw < 2) sw = 2;
       if (sh < 2) sh = 2;
     }
-    debugPrintf("[video] %s: %s %dx%d -> %dx%d, %d thread(s)\n",
+    debugPrintf("[video] %s: %s %dx%d -> %dx%d, %d thread(s)%s\n",
                 s_args.label, vc->name, vp->width, vp->height, sw, sh,
-                vdec->thread_count);
+                vdec->thread_count,
+                BATTD_VIDEO_FAST_DECODE ? ", fast decode (no deblocking)" : "");
     colour_setup(vdec->colorspace, vdec->color_range, vp->height);
   }
 

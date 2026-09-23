@@ -583,7 +583,7 @@ static int dup2_stub(int a, int b) {
   bp_ra_devirtualise(b);
   return b;
 }
-static long pread_impl(int fd, void *buf, size_t n, long off) {
+static long pread_impl_unguarded(int fd, void *buf, size_t n, long off) {
   if (asset_pack_fd_is(fd)) return asset_pack_pread_fd(fd, buf, n, off);
   long cur = lseek(fd, 0, SEEK_CUR);
   if (cur < 0) return -1;
@@ -599,12 +599,26 @@ static long pread_impl(int fd, void *buf, size_t n, long off) {
   watch_dump("pread", fd, (long)off, (long)n, buf, (long)total);
   return (long)total;
 }
-static long pwrite_impl(int fd, const void *buf, size_t n, long off) {
+static long pread_impl(int fd, void *buf, size_t n, long off) {
+  extern int fdg_enter(int); extern void fdg_leave(int);
+  if (!fdg_enter(fd)) return -1;
+  long r = pread_impl_unguarded(fd, buf, n, off);
+  fdg_leave(fd);
+  return r;
+}
+static long pwrite_impl_unguarded(int fd, const void *buf, size_t n, long off) {
   long cur = lseek(fd, 0, SEEK_CUR);
   if (cur < 0) return -1;
   if (lseek(fd, off, SEEK_SET) < 0) return -1;
   long r = write(fd, buf, n);
   lseek(fd, cur, SEEK_SET);
+  return r;
+}
+static long pwrite_impl(int fd, const void *buf, size_t n, long off) {
+  extern int fdg_enter(int); extern void fdg_leave(int);
+  if (!fdg_enter(fd)) return -1;
+  long r = pwrite_impl_unguarded(fd, buf, n, off);
+  fdg_leave(fd);
   return r;
 }
 static int uname_fake(void *buf) { if (buf) memset(buf, 0, 390); return 0; }

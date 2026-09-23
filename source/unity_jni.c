@@ -731,10 +731,18 @@ void *unity_dispatch_object(void *recv, const void *id_, va_list va){ const stru
       DIR *d = opendir(f->path);
       if (!d) return NULL;                     /* Java: null when not a directory */
       int cap = 64, cnt = 0; void **tmp = malloc(cap * sizeof *tmp);
+      if (!tmp) { closedir(d); return NULL; }
       struct dirent *de;
       while ((de = readdir(d)) != NULL) {
         if (!strcmp(de->d_name,".")||!strcmp(de->d_name,"..")) continue;
-        if (cnt == cap) { cap *= 2; tmp = realloc(tmp, cap * sizeof *tmp); }
+        if (cnt == cap) {
+          /* Never assign realloc straight back: on failure it returns NULL but
+           * leaves the old block alive, so "tmp = realloc(tmp, ...)" leaks it
+           * AND the next line writes through NULL. Stop listing instead. */
+          void **grown = realloc(tmp, (size_t)cap * 2 * sizeof *tmp);
+          if (!grown) break;
+          tmp = grown; cap *= 2;
+        }
         if (names) tmp[cnt++] = jni_make_string(de->d_name);
         else { snprintf(buf, sizeof buf, "%s/%s", f->path, de->d_name); tmp[cnt++] = uh_file(buf); }
       }

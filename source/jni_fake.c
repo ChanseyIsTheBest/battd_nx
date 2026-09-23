@@ -1841,7 +1841,9 @@ static void *new_object_dispatch(void *cls, void *mid, void *first_arg) {
     FakeID *m = mid;
     if (m && strstr(m->sig, "[B")) {              /* String([B...) */
       int len = 0; char *b = jni_bytearray_data(first_arg, &len);
-      if (b && len > 0) { char *t = malloc(len + 1); memcpy(t, b, len); t[len] = 0;
+      if (b && len > 0) { char *t = malloc(len + 1);
+        if (!t) return jni_make_string("");     /* near the wall: empty, not a NULL write */
+        memcpy(t, b, len); t[len] = 0;
         void *s = jni_make_string(t); free(t); return s; }
       return jni_make_string("");
     }
@@ -2162,6 +2164,7 @@ static void *j_NewString(void *env, const uint16_t *u, int len) {
   (void)env;
   if (!u || len < 0) return jni_make_string("");
   char *tmp = malloc((size_t)len * 4 + 1);
+  if (!tmp) return jni_make_string("");        /* near the wall: empty, not a NULL write */
   int o = 0;
   for (int i = 0; i < len; i++) { // naive UTF-16 -> UTF-8 (BMP)
     const uint32_t c = u[i];

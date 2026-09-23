@@ -276,6 +276,50 @@ static int readable_region(uint64_t a, uint64_t *lo, uint64_t *hi) {
   return 1;
 }
 
+/* THE TARGET'S STACK, COPIED WHILE IT WAS FROZEN.
+ *
+ * snapshot_thread() used to pause the target, take its registers, RESUME it,
+ * and only then walk and scan its stack. From the resume on, that thread is
+ * running: it can return out of the frames being walked, and it can EXIT, which
+ * unmaps its stack. readable_region() then reports a region that was genuinely
+ * mapped when it asked, and the read a moment later faults inside those bounds.
+ *
+ * That is this crash, and it has happened at least twice: the eighth hardware
+ * run ("far inside [slo, shi)", fixed then by tightening readable_region, which
+ * treats a bad SP but not this) and again on 1.1.4, at the 12-second heartbeat
+ * dump, reading 0x51cf7be5f8 inside a 2 MB stack whose owner had just gone. It
+ * is a READ of unmapped memory, with 262 MB of arena and ~750 MB of heap free,
+ * so it is not OOM, though it lands in the same place and looks the same.
+ *
+ * So the region is queried and the top of the stack copied WHILE THE THREAD IS
+ * STILL PAUSED, and every stack read below comes from the copy. The pause grows
+ * by one svcQueryMemory and a 16 KB memcpy -- microseconds -- and nothing that
+ * writes to the card happens inside it. A frame-pointer chain that climbs past
+ * the copied window simply stops: a shorter backtrace, never a fault.
+ *
+ * Static, not on the stack: the watchdog's own stack is 16 KB. Only the
+ * watchdog thread calls snapshot_thread(), so one buffer is enough. */
+static uint8_t  g_stk_copy[0x4000];
+static uint64_t g_stk_lo, g_stk_hi;     /* the target addresses g_stk_copy holds */
+
+static void stack_snapshot(uint64_t sp) {
+  g_stk_lo = g_stk_hi = 0;
+  uint64_t lo, hi;
+  if (!readable_region(sp, &lo, &hi)) return;
+  uint64_t a = sp & ~7ull;
+  if (a < lo) a = lo;
+  uint64_t b = a + sizeof g_stk_copy;
+  if (b > hi) b = hi;
+  if (b <= a) return;
+  memcpy(g_stk_copy, (const void *)(uintptr_t)a, (size_t)(b - a));
+  g_stk_lo = a; g_stk_hi = b;
+}
+static int stack_rd64(uint64_t a, uint64_t *out) {
+  if ((a & 7) || a < g_stk_lo || a + 8 > g_stk_hi) return 0;
+  memcpy(out, g_stk_copy + (a - g_stk_lo), 8);
+  return 1;
+}
+
 static void dump_thread_context(const char *name, const ThreadContext *ctx) {
   char a[40], b[40];
   resolve_addr(a, sizeof a, ctx->pc.x);
@@ -291,14 +335,14 @@ static void dump_thread_context(const char *name, const ThreadContext *ctx) {
   /* Clean backtrace via the frame-pointer (x29) chain: [fp]=caller fp, [fp+8]=lr.
    * Bound every dereference to the thread's mapped stack so a wild fp can't fault
    * the watchdog itself. */
-  uint64_t slo = 0, shi = 0;
-  { if (!readable_region(ctx->sp, &slo, &shi)) { slo = shi = 0; } }
+  /* Every read comes from the frozen copy (see g_stk_copy). The old code also
+   * had a "loose guard" for when the region query FAILED -- it went on to
+   * dereference fp anyway, which is the one case where the read is certain to
+   * fault. With a copy there is no such case: out of window means stop. */
   uint64_t fp = ctx->fp;
   for (int depth = 0; depth < 32 && (fp & 7) == 0; depth++) {
-    if (slo) { if (fp < slo || fp + 16 > shi) break; }     /* stay in mapped stack */
-    else if (fp < 0x1000) break;                            /* query failed: loose guard */
-    const uint64_t nextfp = ((const uint64_t *)(uintptr_t)fp)[0];
-    const uint64_t lr     = ((const uint64_t *)(uintptr_t)fp)[1];
+    uint64_t nextfp, lr;
+    if (!stack_rd64(fp, &nextfp) || !stack_rd64(fp + 8, &lr)) break;
     if (!lr) break;
     char s[40]; resolve_addr(s, sizeof s, lr);
     wdPrintf("[wd]     bt[%d] %s\n", depth, s);
@@ -310,14 +354,14 @@ static void dump_thread_context(const char *name, const ThreadContext *ctx) {
    * points into libunity / libil2cpp code -- those are return addresses the FP
    * walk missed, and they reveal what the thread is actually wedged inside.
    * Caller gates this (main/loader threads only) to keep the log readable. */
-  if (g_scan_stack && slo) {
-    uint64_t sp = ctx->sp & ~7ull;
-    if (sp < slo) sp = slo;
+  if (g_scan_stack && g_stk_hi) {
+    const uint64_t sp = g_stk_lo;
     uint64_t top = sp + 0x2000;            /* ~1024 slots is plenty for the active frames */
-    if (top > shi) top = shi;
+    if (top > g_stk_hi) top = g_stk_hi;
     int printed = 0;
     for (uint64_t addr = sp; addr + 8 <= top && printed < 24; addr += 8) {
-      uint64_t v = ((const uint64_t *)(uintptr_t)addr)[0];
+      uint64_t v;
+      if (!stack_rd64(addr, &v)) break;
       so_module *m = so_find_module_by_addr((const void *)(uintptr_t)v);
       if (!m) continue;
       if (!strstr(m->name, "unity") && !strstr(m->name, "il2cpp")) continue;  /* skip glue/main */
@@ -429,6 +473,11 @@ static void snapshot_thread(DiagThread *t) {
   ThreadContext ctx;
   Result pr = snap_pause(t);
   Result gr = R_SUCCEEDED(pr) ? svcGetThreadContext3(&ctx, t->handle) : pr;
+  /* Copy the stack BEFORE letting the thread go -- see g_stk_copy. Only when
+   * the pause actually took: an unpaused thread's stack is exactly as unsafe
+   * to read now as it was after the old resume, so it gets no scan at all. */
+  g_stk_lo = g_stk_hi = 0;
+  if (R_SUCCEEDED(pr) && R_SUCCEEDED(gr)) stack_snapshot(ctx.sp);
   if (R_SUCCEEDED(pr)) snap_resume(t);
   if (R_FAILED(gr)) { wdPrintf("[wd]   %-16s (snapshot failed rc=0x%x)\n", t->name, gr); return; }
   /* Scan the stack only for the threads whose wait we actually need to diagnose:
@@ -481,17 +530,15 @@ static void sample_managed_frames(void) {
   ThreadContext ctx;
   Result pr = snap_pause(t);
   Result gr = R_SUCCEEDED(pr) ? svcGetThreadContext3(&ctx, t->handle) : pr;
+  /* Same rule as snapshot_thread(): copy the stack while the thread is frozen,
+   * read only the copy. See g_stk_copy. */
+  g_stk_lo = g_stk_hi = 0;
+  if (R_SUCCEEDED(pr) && R_SUCCEEDED(gr)) stack_snapshot(ctx.sp);
   if (R_SUCCEEDED(pr)) snap_resume(t);
-  if (R_FAILED(gr)) return;
+  if (R_FAILED(gr) || !g_stk_hi) return;
 
-  uint64_t slo = 0, shi = 0;
-  { if (!readable_region(ctx.sp, &slo, &shi)) { slo = shi = 0; } }
-  if (!slo) return;
-
-  uint64_t sp = ctx.sp & ~7ull;
-  if (sp < slo) sp = slo;
-  uint64_t top = sp + 0x4000;
-  if (top > shi) top = shi;
+  const uint64_t sp = g_stk_lo;
+  const uint64_t top = g_stk_hi;
 
   /* Managed code lives in libil2cpp's `il2cpp` section, NOT in .text -- .text is
    * the native runtime (the GC, the metadata loader). The first samples mixed
@@ -500,7 +547,8 @@ static void sample_managed_frames(void) {
    * again: anything below IL2CPP_MANAGED_BASE is native. */
   int printed = 0, native = 0;
   for (uint64_t a = sp; a + 8 <= top && printed < 24; a += 8) {
-    uint64_t v = ((const uint64_t *)(uintptr_t)a)[0];
+    uint64_t v;
+    if (!stack_rd64(a, &v)) break;
     so_module *m = so_find_module_by_addr((const void *)(uintptr_t)v);
     if (!m || !strstr(m->name, "il2cpp")) continue;
     if (!prev_word_readable(m, v)) continue;      /* v-4 would leave the module */
@@ -579,6 +627,34 @@ static void dump_threads(int episode, uint64_t now) {
   rawlog_commit();                 /* the dump is on the card as a unit; beacons are not committed */
 }
 
+/* MEMORY, AS SEEN FROM THE ONE THREAD THAT KEEPS RUNNING.
+ *
+ * When a scene load hangs, the main thread is inside Unity's loader and never
+ * gets back to the frame loop, so the [mem] sampler there goes quiet exactly
+ * when memory matters most; and a hang, unlike a crash, never flushes
+ * debug.log. The watchdog still wakes every second. So it reports here, from
+ * inputs that take no lock -- the allocation-failure counters in the wrappers,
+ * the arena bitmap, the GPU arena counters -- and never calls mallinfo(),
+ * which takes the allocator's lock and would block the watchdog behind the
+ * very starvation it is trying to see. wd.log is written with the lock-free
+ * raw writer and COMMITTED, because these lines only matter if they survive
+ * a hang. */
+static void report_memory(const char *why, int commit) {
+  extern void bp_alloc_fail_stats(unsigned *, size_t *, size_t *);
+  extern void bp_mmap_stats(size_t *, size_t *, size_t *, size_t *);
+  extern void bp_gpua_stats(size_t *, size_t *, size_t *);
+  unsigned fn = 0; size_t fmax = 0, flast = 0;
+  size_t a_res = 0, a_use = 0, a_peak = 0, fb = 0, g_res = 0, g_live = 0, g_peak = 0;
+  bp_alloc_fail_stats(&fn, &fmax, &flast);
+  bp_mmap_stats(&a_res, &a_use, &a_peak, &fb);
+  bp_gpua_stats(&g_res, &g_live, &g_peak);
+  wdPrintf("[wd] mem (%s) frame=%d: allocation failures %u (largest %zu KB, last %zu KB) | "
+           "mmap arena %zu/%zu MB | GPU arena %zu/%zu MB | fallback maps %zu MB\n",
+           why, g_frame, fn, fmax >> 10, flast >> 10,
+           a_use >> 20, a_res >> 20, g_live >> 20, g_res >> 20, fb >> 20);
+  if (commit) rawlog_commit();
+}
+
 static void watchdog_main(void *unused) {
   (void)unused;
   /* Own bionic TLS block. Every other thread that can reach engine-adjacent code
@@ -607,6 +683,33 @@ static void watchdog_main(void *unused) {
         wdPrintf("[wd] alive: frame=%d idle=%llums%s\n",
                     g_frame, (unsigned long long)(tick_to_ns(idle) / 1000000ull),
                     tick_to_ns(idle) >= DIAG_STALL_NS ? "  STALLED" : "");
+        report_memory("beacon", 0);
+      }
+    }
+
+    /* Memory: immediately on any new allocation failure, and every 2 s while
+     * frames are not advancing -- the window a load spends starving, which
+     * the 8 s stall threshold below does not reach until it is over. Capped
+     * per episode so a genuine forever-hang does not write forever. Two
+     * seconds of committed writes during a stall is a few lines; the logging
+     * that hurt loads before was dozens of commits a second. */
+    {
+      static unsigned seen_fail;
+      static uint64_t last_mem;
+      static int lines_this_stall;
+      unsigned fn = 0; size_t fx, fl;
+      { extern void bp_alloc_fail_stats(unsigned *, size_t *, size_t *);
+        bp_alloc_fail_stats(&fn, &fx, &fl); }
+      const int starving = tick_to_ns(idle) >= 2000000000ull;
+      if (!starving) lines_this_stall = 0;
+      if (fn != seen_fail) {
+        seen_fail = fn;
+        report_memory("ALLOCATION FAILED", 1);
+        last_mem = now;
+      } else if (starving && lines_this_stall < 40 &&
+                 tick_to_ns(now - last_mem) >= 2000000000ull) {
+        report_memory("frames not advancing", 1);
+        last_mem = now; lines_this_stall++;
       }
     }
 

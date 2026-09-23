@@ -274,6 +274,32 @@ int bp_boot_and_run(void) {
         extern void bp_gpua_stats(size_t*,size_t*,size_t*);
         extern void bp_ram_stats(size_t*,size_t*);
         bp_mmap_stats(&a_res,&a_use,&a_peak,&fb); bp_gpua_stats(&g_res,&g_live,&g_peak); bp_ram_stats(&img,&imgu);
+        size_t cm=0, dc=0; unsigned cn=0;
+        { extern void bp_mmap_commit_stats(size_t*,size_t*,unsigned*); bp_mmap_commit_stats(&cm,&dc,&cn); }
+        /* live = what Unity has mprotect(RW)'d and not handed back. The gap
+         * between that and the arena's reservation is memory the port is
+         * holding for address space Unity has never touched. */
+        /* IS THE HEAP ACTUALLY 2981 MB? A 64 MB allocation returned NULL while
+         * the pool held 2168 used + 10 free = 2178 MB, with ~800 MB of the
+         * granted heap apparently untouched and a 0 MB top chunk. mallinfo's
+         * "arena" is the space sbrk has actually handed the allocator, so it
+         * settles whether the pool can still grow or whether 2981 is a figure
+         * newlib never really got. If arena stops climbing well below 2981,
+         * the ceiling is sbrk, not Unity's appetite. */
+        debugPrintf("[mem] allocator pool %zu MB from sbrk (top chunk %zu MB, %zu free) "
+                    "of the %d MB newlib was granted -- %s\n",
+                    (size_t)mi.arena >> 20, (size_t)mi.keepcost >> 20, free_now >> 20,
+                    2981,
+                    ((size_t)mi.arena >> 20) + 64 < 2981 ? "room to grow"
+                                                         : "AT THE CEILING");
+        { size_t fb=0; unsigned ac=0, mc=0;
+          extern void bp_munmap_stats(size_t*,unsigned*,unsigned*);
+          bp_munmap_stats(&fb,&ac,&mc);
+          debugPrintf("[mem] munmap: %u calls, %u of them inside the arena, %zu MB returned "
+                      "-- arena peak %zu now %zu\n", mc, ac, fb >> 20, a_peak >> 20, a_use >> 20); }
+        debugPrintf("[mem] Unity committed %zu MB of the %zu MB the arena holds (%u mprotects) "
+                    "-- gap %zd MB is reserved-but-untouched\n",
+                    (cm - dc) >> 20, a_use >> 20, cn, (ssize_t)(a_use - (cm - dc)) >> 20);
         debugPrintf("[mem] heap %zu MB used / %zu free. Of that: mmap arena %zu reserved (peak %zu, now %zu), "
                     "GPU arena %zu reserved (peak %zu), cache image %zu, fallback maps %zu (%zu held by "
                     "refused partial unmaps). Rest (~%zu) is Unity + newlib.\n",

@@ -98,7 +98,7 @@ double bp_nextafter(double x, double y) {
  *   - A zero-length iovec entry is skipped, not passed to write(). write(fd, p, 0)
  *     is defined but some fake-fd backends treat it as EOF.
  * ------------------------------------------------------------------------ */
-ssize_t bp_writev(int fd, const struct nx_iovec *iov, int iovcnt) {
+static ssize_t bp_writev_unguarded(int fd, const struct nx_iovec *iov, int iovcnt) {
   if (!iov || iovcnt < 0) { errno = EINVAL; return -1; }
 
   ssize_t total = 0;
@@ -116,6 +116,13 @@ ssize_t bp_writev(int fd, const struct nx_iovec *iov, int iovcnt) {
     if ((size_t)n < len) break;   /* short write -- stop, report progress */
   }
   return total;
+}
+ssize_t bp_writev(int fd, const struct nx_iovec *iov, int iovcnt) {
+  extern int fdg_enter(int); extern void fdg_leave(int);
+  if (!fdg_enter(fd)) return -1;
+  ssize_t r = bp_writev_unguarded(fd, iov, iovcnt);
+  fdg_leave(fd);
+  return r;
 }
 
 /* ---------------------------------------------------------------------------

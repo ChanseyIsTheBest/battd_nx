@@ -441,11 +441,14 @@ int main(int argc, char *argv[]) {
   }
   /* The NRO's own layout, once, so a crash report can be symbolised without
    * reconstructing the base from a bss anchor. */
-  { extern char __start__[];
-    extern char __bss_start__[], __bss_end__[];
+  { extern char __bss_start__[], __bss_end__[];
     MemoryInfo mi; u32 pi;
-    debugPrintf("[mem] NRO: _start=%p bss=%p..%p\n", (void *)__start__, (void *)__bss_start__, (void *)__bss_end__);
-    if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u64)(uintptr_t)__start__)))
+    /* NOT __start__: that is an ABSOLUTE linker symbol equal to 0, so querying
+     * it reports type=0 perm=--- and looks alarming. Use the address of a real
+     * function in .text instead -- svcQueryMemory itself will do. */
+    const void *text = (const void *)(uintptr_t)&svcQueryMemory;
+    debugPrintf("[mem] NRO: text=%p bss=%p..%p\n", text, (void *)__bss_start__, (void *)__bss_end__);
+    if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u64)(uintptr_t)text)))
       debugPrintf("[mem] NRO text block: %p +0x%llx type=0x%x perm=%c%c%c\n",
                   (void *)(uintptr_t)mi.addr, (unsigned long long)mi.size, (unsigned)mi.type,
                   (mi.perm & Perm_R) ? 'R' : '-', (mi.perm & Perm_W) ? 'W' : '-', (mi.perm & Perm_X) ? 'X' : '-'); }

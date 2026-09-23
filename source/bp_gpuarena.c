@@ -153,10 +153,22 @@ static void *gpua_alloc(size_t sz) {
 
   void *out = NULL;
   mutexLock(&gpua_lock);
-  for (int pass = 0; pass < 2 && !out; pass++) {     /* hint first, then wrap */
-    size_t i   = pass ? 0 : gpua_hint;
-    size_t end = pass ? gpua_hint : gpua_pages;
-    while (i + need <= end) {
+  /* Two passes over START POSITIONS: [hint, pages) first, then [0, hint).
+   * A run may always extend to the end of the arena.
+   *
+   * The old second pass bounded the run's END by the hint ("i + need <= hint"),
+   * so a free run that started before the hint and finished after it was never
+   * considered by either pass. The arena then returned NULL with a fitting run
+   * free -- proven with the real code: 20 free pages at 90..109, hint at 100,
+   * a 20-page request came back NULL. A spurious NULL here sends the buffer to
+   * the general heap (the fragmentation this arena exists to stop) and near the
+   * memory wall that fails too: nouveau_bo_new -> GL_OUT_OF_MEMORY -> the
+   * compositor wedge, a hard system crash. Whether a run straddles the hint
+   * depends on allocation history, so it differed from boot to boot. */
+  for (int pass = 0; pass < 2 && !out; pass++) {
+    size_t i     = pass ? 0 : gpua_hint;
+    size_t istop = pass ? gpua_hint : gpua_pages;   /* last start position, exclusive */
+    while (i < istop && i + need <= gpua_pages) {
       size_t run = 0;
       while (run < need && !gpua_used[i + run]) run++;
       if (run == need) {
@@ -212,6 +224,35 @@ unsigned bp_gpua_live_mb(void) {
  * non-GPU data and starves the buffers it exists to serve -- the exact opposite
  * of the intent, and it would have looked like the arena "not helping" rather
  * than like a bug. */
+/* ALLOCATION FAILURES, counted where every allocation passes.
+ *
+ * When the game hangs at a scene load, the question is always "did it run out
+ * of memory", and the log could not answer it: the [mem] sampler lives in the
+ * main thread's frame loop, which a synchronous load never returns to, and a
+ * hang never runs the crash handler's flush. A failed allocation is the direct
+ * evidence, so it is counted HERE, in the wrappers every malloc/calloc/realloc/
+ * memalign already goes through, with atomics only -- no lock, no I/O, nothing
+ * that could itself fail or block inside a failing allocator. The watchdog
+ * reads these and writes them to wd.log. */
+static volatile uint32_t g_af_n;
+static volatile uint64_t g_af_max, g_af_last;
+static void note_alloc_fail(size_t sz) {
+  if (!sz) return;
+  __atomic_add_fetch(&g_af_n, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&g_af_last, (uint64_t)sz, __ATOMIC_RELAXED);
+  uint64_t cur = __atomic_load_n(&g_af_max, __ATOMIC_RELAXED);
+  while ((uint64_t)sz > cur &&
+         !__atomic_compare_exchange_n(&g_af_max, &cur, (uint64_t)sz, 1,
+                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+int bp_gpua_owns(const void *p) { return gpua_owns((void *)p); }
+
+void bp_alloc_fail_stats(unsigned *n, size_t *largest, size_t *last) {
+  if (n)       *n       = __atomic_load_n(&g_af_n, __ATOMIC_RELAXED);
+  if (largest) *largest = (size_t)__atomic_load_n(&g_af_max, __ATOMIC_RELAXED);
+  if (last)    *last    = (size_t)__atomic_load_n(&g_af_last, __ATOMIC_RELAXED);
+}
+
 void *__wrap_memalign(size_t align, size_t size) {
   void *p = NULL;
   if (gpua_enabled && align >= GPUA_PAGE &&
@@ -280,6 +321,7 @@ void *__wrap_memalign(size_t align, size_t size) {
                   (unsigned)(GPUA_MIN >> 10), (unsigned)(GPUA_MAX >> 20));
     }
   }
+  if (!p) note_alloc_fail(size);
   return p;
 }
 
@@ -302,12 +344,29 @@ void *__wrap_realloc(void *p, size_t size) {
     size_t oldsz = old_pages * GPUA_PAGE;
 
     void *q = __real_malloc(size);
-    if (q) memcpy(q, p, size < oldsz ? size : oldsz);
+    /* realloc's contract: on failure return NULL and leave the original block
+     * untouched. This used to gpua_free(p) regardless, so a caller that did
+     * the normal thing -- keep using p when realloc returns NULL -- was using
+     * freed GPU-arena pages. It can only happen when the allocator is already
+     * out of room, which is exactly when the game is dying and everything
+     * looks like "just OOM". */
+    if (!q) { note_alloc_fail(size); return NULL; }
+    memcpy(q, p, size < oldsz ? size : oldsz);
     gpua_free(p);
     return q;
   }
-  return __real_realloc(p, size);
+  void *q = __real_realloc(p, size);
+  if (!q && size) note_alloc_fail(size);
+  return q;
 }
 
-void *__wrap_malloc(size_t size)          { return __real_malloc(size); }
-void *__wrap_calloc(size_t n, size_t sz)  { return __real_calloc(n, sz); }
+void *__wrap_malloc(size_t size) {
+  void *p = __real_malloc(size);
+  if (!p) note_alloc_fail(size);
+  return p;
+}
+void *__wrap_calloc(size_t n, size_t sz) {
+  void *p = __real_calloc(n, sz);
+  if (!p) { size_t t; note_alloc_fail(__builtin_mul_overflow(n, sz, &t) ? SIZE_MAX : t); }
+  return p;
+}

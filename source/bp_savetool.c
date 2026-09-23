@@ -108,11 +108,407 @@ static char      g_str[N_FIELDS][64];
 typedef struct { char name[48]; long long v; } Dyn;
 static Dyn g_tower[N_DYN];   static int g_ntower;
 static Dyn g_adv[N_DYN];     static int g_nadv;
+static Dyn g_unlock[N_DYN];  static int g_nunlock;
+static int g_unlock_all = -1, g_unlock_items = -1;
+static long long g_item_count = 1, g_tower_level = -1;
 static int g_any;
 
 /* ------------------------------------------------------------------ */
 /* save.txt                                                            */
 /* ------------------------------------------------------------------ */
+/* The whole unlocking section of save.txt: 18 characters, 64 allies, 100
+ * weapons, 166 trinkets. One constant, used both by write_template() for a
+ * new file and by ADDED[] to append it once to an existing one -- 348 lines
+ * duplicated in two places would drift. Ids are checked against ALL_TOWERS
+ * and ALL_ITEMS by tools, and those tables are what actually gets written. */
+static const char SAVE_TXT_UNLOCKS[] =
+  "# --- unlocking ---------------------------------------------------------\n"
+  "# The one thing here that ADDS to the save instead of editing it.\n"
+  "#\n"
+  "# The game stores the two kinds separately and mixing them up crashes it:\n"
+  "#   inventory.towers -- the 18 playable CHARACTERS\n"
+  "#   inventory.items  -- 64 allies, 100 weapons, 166 trinkets\n"
+  "# ALLIES ARE ITEM CARDS, NOT TOWERS. unlock.<Name> works out which list a\n"
+  "# name belongs to; a name in neither is reported and skipped. HotDogKnights\n"
+  "# and MarshmallowKids are summoned units and are in neither.\n"
+  "#\n"
+  "# The name is the game's internal id, taken from the model definitions in\n"
+  "# the towers bundle; the comment is the name you see in game. They often\n"
+  "# differ in ways you would not guess -- BMO is \"Bmo\", BOM-MO is \"BomMo\",\n"
+  "# MOAP is \"Moap\", Liquefier is \"Liquifier\" -- so search the comments.\n"
+  "#\n"
+  "#unlock_all_towers = true      # all 18 characters\n"
+  "#unlock_all_items = true       # all 330 allies, weapons and trinkets\n"
+"#\n"
+"# --- how many, and what level ------------------------------------------\n"
+"# item_count = N    hold N copies of every item unlocked above (max 10).\n"
+"#                   There is no quantity field in the save: N copies is N\n"
+"#                   entries, which is how the game lets you equip the same\n"
+"#                   trinket to several characters. Existing copies count,\n"
+"#                   so raising this tops up instead of duplicating.\n"
+"# tower_level = N   set every character you own to level N. The game caps\n"
+"#                   this at 10 (towerMaxLevel); higher is clamped.\n"
+"# max_everything    all characters, all items, 10 copies each, level 10.\n"
+"#item_count = 1\n"
+"#tower_level = 10\n"
+"#max_everything = true\n"
+  "\n"
+  "# --- characters (18) ----------------------------------------\n"
+  "#unlock.Finn                            = true   # Finn\n"
+  "#unlock.Jake                            = true   # Jake\n"
+  "#unlock.Max                             = true   # Max\n"
+  "#unlock.Bubblegum                       = true   # Princess Bubblegum\n"
+  "#unlock.IceKing                         = true   # Ice King\n"
+  "#unlock.CaptainCassie                   = true   # Captain Cassie\n"
+  "#unlock.Marceline                       = true   # Marceline\n"
+  "#unlock.Sam                             = true   # Sam\n"
+  "#unlock.FlamePrincess                   = true   # Flame Princess\n"
+  "#unlock.C4Charlie                       = true   # C4 Charlie\n"
+  "#unlock.Sai                             = true   # Sai\n"
+  "#unlock.SuperMonkey                     = true   # Supermonkey\n"
+  "#unlock.WarriorFinn                     = true   # Dungeon Finn\n"
+  "#unlock.SerenadingJake                  = true   # Tuxedo Jake\n"
+  "#unlock.JuggernautMax                   = true   # Juggernaut Max\n"
+  "#unlock.WarmasterBubblegum              = true   # Warrior Bubblegum\n"
+  "#unlock.CommanderCassie                 = true   # Commander Cassie\n"
+  "#unlock.MarcelineTheVampireHunter       = true   # Hunter Marceline\n"
+  "\n"
+  "# --- allies (64) --------------------------------------------\n"
+  "#unlock.Abracadaniel                    = true   # Abracadaniel\n"
+  "#unlock.AncientPsychicTandemWarElephant = true   # Ancient Psychic Tandem War Elephant\n"
+  "#unlock.BananaAirCorps                  = true   # Banana Air Corps\n"
+  "#unlock.BananaGuards                    = true   # Banana Guards\n"
+  "#unlock.BananaMan                       = true   # Banana Man\n"
+  "#unlock.BettyGrof                       = true   # Betty Grof\n"
+  "#unlock.Billy                           = true   # Billy\n"
+  "#unlock.Bmo                             = true   # BMO\n"
+  "#unlock.BoomerangMonkey                 = true   # Boomerang Monkey\n"
+  "#unlock.BusinessMen                     = true   # Business Men\n"
+  "#unlock.CinnamonBun                     = true   # Cinnamon Bun\n"
+  "#unlock.Clarence                        = true   # Clarence\n"
+  "#unlock.Cobra                           = true   # COBRA\n"
+  "#unlock.DartMonkey                      = true   # Dart Monkey\n"
+  "#unlock.DirtBeerGuy                     = true   # Dirt Beer Guy\n"
+  "#unlock.DrMonkey                        = true   # Dr Monkey\n"
+  "#unlock.ElfMonkey                       = true   # Elf Monkey\n"
+  "#unlock.FlameKing                       = true   # Flame King\n"
+  "#unlock.GhostPrincess                   = true   # Ghost princess\n"
+  "#unlock.GrassyWizard                    = true   # Grassy Wizard\n"
+  "#unlock.GrobGobGlobGrod                 = true   # Grob Gob Glob Grod\n"
+  "#unlock.Gumbald                         = true   # Gumbald\n"
+  "#unlock.Gunter                          = true   # Gunter\n"
+  "#unlock.HolidayBmo                      = true   # Holiday BMO\n"
+  "#unlock.HunsonAbadeer                   = true   # Hunson Abadeer\n"
+  "#unlock.HuntressWizard                  = true   # Huntress Wizard\n"
+  "#unlock.IceMonkey                       = true   # Ice Monkey\n"
+  "#unlock.KingOfOoo                       = true   # King of Ooo\n"
+  "#unlock.LadyRainicorn                   = true   # Lady Rainicorn\n"
+  "#unlock.LaserButterfly                  = true   # Laser Butterfly\n"
+  "#unlock.Lemonhope                       = true   # Lemonhope\n"
+  "#unlock.LumpySpacePrincess              = true   # Lumpy Space Princess\n"
+  "#unlock.Maja                            = true   # Maja\n"
+  "#unlock.MartianTransport                = true   # Martian Transport\n"
+  "#unlock.Martin                          = true   # Martin\n"
+  "#unlock.Minipults                       = true   # Minipults\n"
+  "#unlock.Moe                             = true   # Moe\n"
+  "#unlock.MonkeyApprentice                = true   # Monkey Apprentice\n"
+  "#unlock.BananaFarmer                    = true   # Monkey Farmer\n"
+  "#unlock.MusclePrincess                  = true   # Muscle Princess\n"
+  "#unlock.Neptr                           = true   # NEPTR\n"
+  "#unlock.PartyGod                        = true   # Party God\n"
+  "#unlock.PeppermintButler                = true   # Peppermint Butler\n"
+  "#unlock.PirateCrew                      = true   # Pirate Crew\n"
+  "#unlock.Rattleballs                     = true   # Rattleballs\n"
+  "#unlock.Ricardio                        = true   # Ricardio\n"
+  "#unlock.Scorcher                        = true   # Scorcher\n"
+  "#unlock.Shoko                           = true   # Shoko\n"
+  "#unlock.SlimePrincess                   = true   # Slime Princess\n"
+  "#unlock.SniperMonkey                    = true   # Sniper Monkey\n"
+  "#unlock.SpaceLards                      = true   # Space Lards\n"
+  "#unlock.Squadron                        = true   # Squadron\n"
+  "#unlock.StarMan                         = true   # Star Man\n"
+  "#unlock.Starchy                         = true   # Starchy\n"
+  "#unlock.SuperFans                       = true   # Super Fans\n"
+  "#unlock.SusanStrong                     = true   # Susan Strong\n"
+  "#unlock.TechnologicalTerror             = true   # Technological Terror\n"
+  "#unlock.TinyManticore                   = true   # Tiny Manticore\n"
+  "#unlock.TrainBoss                       = true   # Train Boss\n"
+  "#unlock.Treetrunks                      = true   # Treetrunks\n"
+  "#unlock.VampireKing                     = true   # Vampire King\n"
+  "#unlock.WaterNymph                      = true   # Water Nymph\n"
+  "#unlock.WildberryPrincess               = true   # Wildberry Princess\n"
+  "#unlock.WizardLord                      = true   # Wizard Lord\n"
+  "\n"
+  "# --- weapons (100) ------------------------------------------\n"
+  "#unlock.4DSword                         = true   # 4D sword\n"
+  "#unlock.AbracadanielsWand               = true   # Abracadaniel's Wand\n"
+  "#unlock.AcousticGuitar                  = true   # Acoustic Guitar\n"
+  "#unlock.AxBass                          = true   # Ax Bass\n"
+  "#unlock.BallBlamBurglerber              = true   # Ball Blam Burglerber\n"
+  "#unlock.Bananarangs                     = true   # Bananarangs\n"
+  "#unlock.Banjo                           = true   # Banjo\n"
+  "#unlock.BarbedDarts                     = true   # Barbed Darts\n"
+  "#unlock.BlessedDart                     = true   # Blessed Dart\n"
+  "#unlock.Bloonsbane                      = true   # Bloonsbane\n"
+  "#unlock.BomMo                           = true   # BOM-MO\n"
+  "#unlock.BombChain                       = true   # Bomb & Chain\n"
+  "#unlock.Bomba                           = true   # Bomba\n"
+  "#unlock.BreadstickWand                  = true   # Breadstick Wand\n"
+  "#unlock.ButterscotchBomb                = true   # Butterscotch Bomb\n"
+  "#unlock.CandyBomb                       = true   # Candy Bomb\n"
+  "#unlock.CandyCaneShotgun                = true   # Candy Cane Shotgun\n"
+  "#unlock.CandyDuckAxe                    = true   # Candy Duck Axe\n"
+  "#unlock.CandyHorseTranquilizer          = true   # Candy Horse Tranquilizer\n"
+  "#unlock.CandyMicrophone                 = true   # Candy Microphone\n"
+  "#unlock.CaptainTreeTrunksCutlass        = true   # Captain Tree Trunks' Cutlass\n"
+  "#unlock.CarbBomb                        = true   # Carb Bomb\n"
+  "#unlock.CherryBlossomWand               = true   # Cherry Blossom Wand\n"
+  "#unlock.CherryBomb                      = true   # Cherry Bomb\n"
+  "#unlock.CryoBomb                        = true   # Cryo Bomb\n"
+  "#unlock.CyberneticArrow                 = true   # Cybernetic Arrow\n"
+  "#unlock.DemonBloodSword                 = true   # Demon Blood Sword\n"
+  "#unlock.DevilMonsterBass                = true   # Devil Monster Bass\n"
+  "#unlock.DrMonkeysSecretWeapon           = true   # Dr Monkey's Secret Weapon\n"
+  "#unlock.DragonFangs                     = true   # Dragon Fangs\n"
+  "#unlock.DrillerDarts                    = true   # Driller Darts\n"
+  "#unlock.DynamiteStack                   = true   # Dynamite Stack\n"
+  "#unlock.ElectrodeGun                    = true   # Electrode Gun\n"
+  "#unlock.Excandybur                      = true   # Excandybur\n"
+  "#unlock.ExplodingPineapples             = true   # Exploding Pineapples\n"
+  "#unlock.FinnSword                       = true   # Finn Sword\n"
+  "#unlock.FinnsFlute                      = true   # Finn's Flute\n"
+  "#unlock.FireGuitar                      = true   # Fire Guitar\n"
+  "#unlock.FireKingdomScepter              = true   # Fire Kingdom Scepter\n"
+  "#unlock.FireSword                       = true   # Fire Sword\n"
+  "#unlock.FrozenThrowingKnives            = true   # Frozen Throwing Knives\n"
+  "#unlock.Fumigator                       = true   # Fumigator\n"
+  "#unlock.GarlicBomb                      = true   # Garlic Bomb\n"
+  "#unlock.GlobsSword                      = true   # Glob's Sword\n"
+  "#unlock.GoldenViola                     = true   # Golden Viola\n"
+  "#unlock.GrassSword                      = true   # Grass Sword\n"
+  "#unlock.GrassWand                       = true   # Grass Wand\n"
+  "#unlock.GrenadeOfGlob                   = true   # Grenade of Glob\n"
+  "#unlock.GuntersTaser                    = true   # Gunter's Taser\n"
+  "#unlock.GwensFlamethrower               = true   # Gwen's Flamethrower\n"
+  "#unlock.HonestyBells                    = true   # Honesty Bells\n"
+  "#unlock.JakesSword                      = true   # Jake's Sword\n"
+  "#unlock.JakesViola                      = true   # Jake's Viola\n"
+  "#unlock.JewelledCabasas                 = true   # Jewelled Cabasas\n"
+  "#unlock.JingleBomb                      = true   # Jingle Bomb\n"
+  "#unlock.LightningBolts                  = true   # Lightning Bolts\n"
+  "#unlock.Liquifier                       = true   # Liquefier\n"
+  "#unlock.LiquidPyrotechnicsLauncher      = true   # Liquid Pyrotechnics Launcher\n"
+  "#unlock.LunaticBass                     = true   # Lunatic Bass\n"
+  "#unlock.MartianBlaster                  = true   # Martian Blaster\n"
+  "#unlock.MartianMic                      = true   # Martian Mic\n"
+  "#unlock.MilitaryDarts                   = true   # Military Darts\n"
+  "#unlock.Moap                            = true   # MOAP\n"
+  "#unlock.MouthOrgan                      = true   # Mouth Organ\n"
+  "#unlock.MushroomBomb                    = true   # Mushroom Bomb\n"
+  "#unlock.NailGun                         = true   # Nail Gun\n"
+  "#unlock.NightSword                      = true   # Night Sword\n"
+  "#unlock.Nothung                         = true   # Nothung\n"
+  "#unlock.PenguinShell                    = true   # Penguin Shell\n"
+  "#unlock.PeppermintBattleAxe             = true   # Peppermint Battle Axe\n"
+  "#unlock.PhoenixWand                     = true   # Phoenix Wand\n"
+  "#unlock.PressureHose                    = true   # Pressure Hose\n"
+  "#unlock.RainbowGlitterWand              = true   # Rainbow Glitter Wand\n"
+  "#unlock.RazorBats                       = true   # Razor Bats\n"
+  "#unlock.RepairedViola                   = true   # Repaired Viola\n"
+  "#unlock.RevengeStick                    = true   # Revenge Stick\n"
+  "#unlock.RodOfNiceness                   = true   # Rod of Niceness\n"
+  "#unlock.RootSword                       = true   # Root Sword\n"
+  "#unlock.SassageFlare                    = true   # Sassage Flare\n"
+  "#unlock.Scarlet                         = true   # Scarlet\n"
+  "#unlock.SilverShurikens                 = true   # Silver Shurikens\n"
+  "#unlock.SilverTippedStakes              = true   # Silver Tipped Stakes\n"
+  "#unlock.SnakeDarts                      = true   # Snake Darts\n"
+  "#unlock.SniperRifle                     = true   # Sniper Rifle\n"
+  "#unlock.SoulRedeemerSword               = true   # Soul Redeemer Sword\n"
+  "#unlock.SpiderWand                      = true   # Spider Wand\n"
+  "#unlock.SplodeyDarts                    = true   # Splodey Darts\n"
+  "#unlock.StickyShots                     = true   # Sticky Shots\n"
+  "#unlock.TheLover                        = true   # The Lover\n"
+  "#unlock.ThievesKatana                   = true   # Thieves' Katana\n"
+  "#unlock.ThoughtCannonWand               = true   # Thought Cannon Wand\n"
+  "#unlock.Thundersword                    = true   # Thundersword\n"
+  "#unlock.TimeBomb                        = true   # Time Bomb\n"
+  "#unlock.UnimaginablyAmazingSword        = true   # Unimaginably Amazing Sword\n"
+  "#unlock.WandOfDispersement              = true   # Wand of Dispersement\n"
+  "#unlock.WebGun                          = true   # Web Gun\n"
+  "#unlock.WishyWand                       = true   # Wishy Wand\n"
+  "#unlock.WizardLordWand                  = true   # Wizard Lord Wand\n"
+  "#unlock.WizardThiefWand                 = true   # Wizard Thief Wand\n"
+  "#unlock.XergioksWand                    = true   # Xergiok's Wand\n"
+  "\n"
+  "# --- trinkets (166) -----------------------------------------\n"
+  "#unlock.AbracadanielsHeadband           = true   # Abracadaniel's Headband\n"
+  "#unlock.AbrahamLincolnsPenny            = true   # Abraham Lincoln's Penny\n"
+  "#unlock.AntiCamoDust                    = true   # Anti-Camo Dust\n"
+  "#unlock.AntiGravityToteChamber          = true   # Anti-Gravity Tote Chamber\n"
+  "#unlock.Apple                           = true   # Apple\n"
+  "#unlock.ApprenticeCap                   = true   # Apprentice Cap\n"
+  "#unlock.ArrowOfIce                      = true   # Arrow of Ice\n"
+  "#unlock.BabyBlanket                     = true   # Baby Blanket\n"
+  "#unlock.BabyTooth                       = true   # Baby Tooth\n"
+  "#unlock.BagOfLollies                    = true   # Bag of Lollies\n"
+  "#unlock.BakersShard                     = true   # Baker's Shard\n"
+  "#unlock.BananaReplicator                = true   # Banana Replicator\n"
+  "#unlock.Basketball                      = true   # Basketball\n"
+  "#unlock.BeANinja                        = true   # Be a Ninja\n"
+  "#unlock.BeauteousWings                  = true   # Beauteous Wings\n"
+  "#unlock.BigRedButton                    = true   # Big Red Button\n"
+  "#unlock.BlackBowTie                     = true   # Black Bow Tie\n"
+  "#unlock.BlazingFeet                     = true   # Blazing Feet\n"
+  "#unlock.BloonTrap                       = true   # Bloon Trap\n"
+  "#unlock.BmosSkateboard                  = true   # BMO's Skateboard\n"
+  "#unlock.BoobooSousa                     = true   # Booboo Sousa\n"
+  "#unlock.BottleRocket                    = true   # Bottle Rocket\n"
+  "#unlock.BoxOfDirt                       = true   # Box of Dirt\n"
+  "#unlock.BrainFood                       = true   # Brain Food\n"
+  "#unlock.BranchesOfPalm                  = true   # Branches of Palm\n"
+  "#unlock.BubblegumsHair                  = true   # Bubblegum's Hair\n"
+  "#unlock.CandyDiveSuit                   = true   # Candy Dive Suit\n"
+  "#unlock.CandySeeds                      = true   # Candy Seeds\n"
+  "#unlock.CandycornSpear                  = true   # Candycorn Spear\n"
+  "#unlock.CaptainTreeTrunksEyepatch       = true   # Captain Tree Trunks' Eyepatch\n"
+  "#unlock.CarlTheGem                      = true   # Carl the Gem\n"
+  "#unlock.CheesyDog                       = true   # Cheesy Dog\n"
+  "#unlock.ClaBlade                        = true   # Cla Blade\n"
+  "#unlock.Condiments                      = true   # Condiments\n"
+  "#unlock.CosmicGauntlets                 = true   # Cosmic Gauntlets\n"
+  "#unlock.Cryojet                         = true   # CryoJet\n"
+  "#unlock.CrystalGemApple                 = true   # Crystal Gem Apple\n"
+  "#unlock.CrystalMergenceOfDestruction    = true   # Crystal Mergence of Destruction\n"
+  "#unlock.CursedIceRing                   = true   # Cursed Ice Ring\n"
+  "#unlock.DaggerOfChilledGlass            = true   # Dagger of Chilled Glass\n"
+  "#unlock.DarkTempleIdol                  = true   # Dark Temple Idol\n"
+  "#unlock.DaveyStache                     = true   # Davey 'Stache\n"
+  "#unlock.DeathsDrums                     = true   # Death's Drums\n"
+  "#unlock.DemonHeart                      = true   # Demon Heart\n"
+  "#unlock.DemonicWishingEye               = true   # Demonic Wishing Eye\n"
+  "#unlock.DiveSuit                        = true   # Dive Suit\n"
+  "#unlock.DoomGauntlets                   = true   # Doom Gauntlets\n"
+  "#unlock.DragonEyes                      = true   # Dragon Eyes\n"
+  "#unlock.ElderPlopsScepter               = true   # Elder Plop's Scepter\n"
+  "#unlock.ElementalStaff                  = true   # Elemental Staff\n"
+  "#unlock.EnchantedBoomerang              = true   # Enchanted Boomerang\n"
+  "#unlock.EngineersBlueprints             = true   # Engineers Blueprints\n"
+  "#unlock.EyeFlail                        = true   # Eye Flail\n"
+  "#unlock.FinnsCrossbow                   = true   # Finn's Crossbow\n"
+  "#unlock.FireCrown                       = true   # Fire Crown\n"
+  "#unlock.FlowerCrown                     = true   # Flower Crown\n"
+  "#unlock.FreezingPotionA                 = true   # Freezing Potion A\n"
+  "#unlock.FutureCrystal                   = true   # Future Crystal\n"
+  "#unlock.GauntletOfBones                 = true   # Gauntlet of Bones\n"
+  "#unlock.GauntletOfTheHero               = true   # Gauntlet of the Hero\n"
+  "#unlock.GemmaTheGemstone                = true   # Gemma the Gemstone\n"
+  "#unlock.GentleLasers                    = true   # Gentle Lasers\n"
+  "#unlock.GiantTranq                      = true   # Giant Tranq\n"
+  "#unlock.GlaiveOfTheAncients             = true   # Glaive of the Ancients\n"
+  "#unlock.GlassesOfNerdicon               = true   # Glasses of Nerdicon\n"
+  "#unlock.GlobsHelmet                     = true   # Glob's Helmet\n"
+  "#unlock.Googoomamameter                 = true   # Googoomamameter\n"
+  "#unlock.GrapplingCrossbow               = true   # Grappling crossbow\n"
+  "#unlock.GraveRing                       = true   # Grave Ring\n"
+  "#unlock.Hambo                           = true   # Hambo\n"
+  "#unlock.HeartGauntlets                  = true   # Heart Gauntlets\n"
+  "#unlock.HollyJollyScarf                 = true   # Holly Jolly Scarf\n"
+  "#unlock.HollyJollySweater               = true   # Holly Jolly Sweater\n"
+  "#unlock.HorseySoap                      = true   # Horsey Soap\n"
+  "#unlock.IceBull                         = true   # Ice Bull\n"
+  "#unlock.IceCreamSundae                  = true   # Ice Cream Sundae\n"
+  "#unlock.IceCrook                        = true   # Ice Crook\n"
+  "#unlock.IcebergBlade                    = true   # Iceberg Blade\n"
+  "#unlock.IronHull                        = true   # Iron Hull\n"
+  "#unlock.IssueOfBle                      = true   # Issue of Ble\n"
+  "#unlock.JamesLuckyCoin                  = true   # James' Lucky Coin\n"
+  "#unlock.Jetpack                         = true   # Jetpack\n"
+  "#unlock.KingOfOoosSceptre               = true   # King of Ooo's Scepter\n"
+  "#unlock.KnifeStormCloud                 = true   # Knife Storm Cloud\n"
+  "#unlock.LambRelic                       = true   # Lamb Relic\n"
+  "#unlock.Lemonsweets                     = true   # Lemonsweets\n"
+  "#unlock.LittleDude                      = true   # Little Dude\n"
+  "#unlock.LumpinDeliciousSandwiches       = true   # Lumpin Delicious Sandwiches\n"
+  "#unlock.LuteSuit                        = true   # Lute Suit\n"
+  "#unlock.MaceStake                       = true   # Mace Stake\n"
+  "#unlock.MagicCarpet                     = true   # Magic Carpet\n"
+  "#unlock.MagicCoinPurse                  = true   # Magic Coin Purse\n"
+  "#unlock.MagicDoorPortal                 = true   # Magic Door Portal\n"
+  "#unlock.MagicMansHat                    = true   # Magic Man's Hat\n"
+  "#unlock.MagicPowder                     = true   # Magic Powder\n"
+  "#unlock.MagicSpanner                    = true   # Magic Spanner\n"
+  "#unlock.MargaretsMusicBox               = true   # Margaret's Music Box\n"
+  "#unlock.MartianTrackingDevice           = true   # Martian Tracking Device\n"
+  "#unlock.MaskOfShadows                   = true   # Mask of Shadows\n"
+  "#unlock.MedallionOfBrogends             = true   # Medallion of Brogends\n"
+  "#unlock.MindGames                       = true   # Mind Games\n"
+  "#unlock.Missile                         = true   # Missile\n"
+  "#unlock.MonkeyAcademyDegree             = true   # Monkey Academy Degree\n"
+  "#unlock.MonkeyKingsRobe                 = true   # Monkey King's Robe\n"
+  "#unlock.MortarHelmet                    = true   # Mortar Helmet\n"
+  "#unlock.MysteryCavePick                 = true   # Mystery Cave Pick\n"
+  "#unlock.NightVisionXRayGoggles          = true   # Night Vision X-Ray goggles\n"
+  "#unlock.NinjaDagger                     = true   # Ninja Dagger\n"
+  "#unlock.NinjaHeadband                   = true   # Ninja Headband\n"
+  "#unlock.NumbChuks                       = true   # Numb-Chuks\n"
+  "#unlock.PaperPlateMask                  = true   # Paper Plate Mask\n"
+  "#unlock.PeacockHat                      = true   # Peacock Hat\n"
+  "#unlock.PennysDagger                    = true   # Penny's Dagger\n"
+  "#unlock.PinkSweater                     = true   # Pink Sweater\n"
+  "#unlock.PirateHat                       = true   # Pirate Hat\n"
+  "#unlock.PlasmaGoggles                   = true   # Plasma Goggles\n"
+  "#unlock.PocketWatch                     = true   # Pocket Watch\n"
+  "#unlock.PowerRingOfChill                = true   # Power Ring of Chill\n"
+  "#unlock.PowerRingOfDamage               = true   # Power Ring of Damage\n"
+  "#unlock.PowerRingOfPierce               = true   # Power Ring of Pierce\n"
+  "#unlock.PowerRingOfPoison               = true   # Power Ring of Poison\n"
+  "#unlock.PowerRingOfRange                = true   # Power Ring of Range\n"
+  "#unlock.PowerRingOfSpeed                = true   # Power Ring of Speed\n"
+  "#unlock.PowerRingOfStrength             = true   # Power Ring of Strength\n"
+  "#unlock.Powerometer                     = true   # Powerometer\n"
+  "#unlock.PrincessPlant                   = true   # Princess Plant\n"
+  "#unlock.ProtectionGem                   = true   # Protection Gem\n"
+  "#unlock.RCPlane                         = true   # R/C Plane\n"
+  "#unlock.Rainicornicopia                 = true   # Rainicornicopia\n"
+  "#unlock.RedBowTie                       = true   # Red Bow Tie\n"
+  "#unlock.RedCowboyBoots                  = true   # Red Cowboy boots\n"
+  "#unlock.RenceHilt                       = true   # Rence Hilt\n"
+  "#unlock.RoboMonkeyVisor                 = true   # Robo-Monkey Visor\n"
+  "#unlock.RockShirt                       = true   # Rock Shirt\n"
+  "#unlock.RoyalMedalForHeroicBravery      = true   # Royal Medal for Heroic Bravery\n"
+  "#unlock.SacredSpringScarf               = true   # Sacred Spring Scarf\n"
+  "#unlock.ShardOfEverfrost                = true   # Shard of Everfrost\n"
+  "#unlock.SilverDagger                    = true   # Silver Dagger\n"
+  "#unlock.SirenHat                        = true   # Siren Hat\n"
+  "#unlock.SniperBeret                     = true   # Sniper Beret\n"
+  "#unlock.SoftPretzels                    = true   # Soft Pretzels\n"
+  "#unlock.SoulStone                       = true   # Soul Stone\n"
+  "#unlock.SpecialSentientSandwich         = true   # Special Sentient Sandwich\n"
+  "#unlock.SpoonOfProsperity               = true   # Spoon of Prosperity\n"
+  "#unlock.StoneOfAncientKnowledge         = true   # Stone of Ancient Knowledge\n"
+  "#unlock.StoneSkinPotion                 = true   # Stone Skin Potion\n"
+  "#unlock.Strawberry                      = true   # Strawberry\n"
+  "#unlock.StrikerJonesCap                 = true   # Striker Jones' Cap\n"
+  "#unlock.SuperPorp                       = true   # Super Porp\n"
+  "#unlock.Taser                           = true   # Taser\n"
+  "#unlock.ThiefCrossbow                   = true   # Thief Crossbow\n"
+  "#unlock.ThiefKingsDagger                = true   # Thief King's Dagger\n"
+  "#unlock.TigerClaw                       = true   # Tiger Claw\n"
+  "#unlock.TikiShield                      = true   # Tiki Shield\n"
+  "#unlock.TimeTravelMachine               = true   # Time Travel Machine\n"
+  "#unlock.TreasureChestKeys               = true   # Treasure Chest Keys\n"
+  "#unlock.TreetrunksAppleKnife            = true   # Treetrunk's Apple Knife\n"
+  "#unlock.TreetrunksDagger                = true   # Treetrunk's Dagger\n"
+  "#unlock.Trident                         = true   # Trident\n"
+  "#unlock.UniversalCoin                   = true   # Universal Coin\n"
+  "#unlock.VorpalHand                      = true   # Vorpal Hand\n"
+  "#unlock.WarningHorn                     = true   # Warning Horn\n"
+  "#unlock.WarpaintMud                     = true   # Warpaint Mud\n"
+  "#unlock.WhistlingBook                   = true   # Whistling Book\n"
+  "#unlock.WindmillDagger                  = true   # Windmill Dagger\n"
+  "#unlock.WizardNunchuks                  = true   # Wizard Nunchuks\n";
+
 static void write_template(const char *path) {
   FILE *f = fopen(path, "w");
   if (!f) { debugPrintf("[save] could not write %s\n", path); return; }
@@ -154,9 +550,14 @@ static void write_template(const char *path) {
 "# tower.<Name> sets that hero's level. The name is whatever the save already\n"
 "# holds, so heroes added by a game update work without changing the port.\n"
 "# A new profile starts with Finn, Jake and Max.\n"
-"#tower.Finn = 20\n"
-"#tower.Jake = 20\n"
-"#tower.Max = 20\n"
+"# The cap is 10; higher values are clamped.\n"
+"#tower.Finn = 10\n"
+"#tower.Jake = 10\n"
+"#tower.Max = 10\n"
+"\n",
+    f);
+  fputs(SAVE_TXT_UNLOCKS, f);
+  fputs(
 "\n"
 "# --- adventures ------------------------------------------------------\n"
 "# adventure.<Name> = true unlocks it. Names in a fresh save:\n"
@@ -194,11 +595,20 @@ static int mentions_key(const char *text, const char *key) {
  * a row here, not just to write_template(), when a new setting is introduced:
  * write_template only runs for a file that does not exist yet. */
 static const struct { const char *keys[2]; const char *block; } ADDED[] = {
-  { { NULL, NULL }, NULL },   /* keep the array non-empty; skipped below */
+  /* The unlock section, with every tower listed one per line. Keyed on
+   * unlock_all_towers, which the block itself mentions, so it is appended
+   * exactly once to a save.txt that predates it. */
+  { { "unlock_all_towers", NULL },
+    SAVE_TXT_UNLOCKS },
 };
 
 static void append_missing(const char *path) {
-  char text[16384];
+  /* save.txt is ~26 KB now that every unlockable name is listed. This buffer
+   * only has to be big enough for mentions_key() to SEE a key that is already
+   * in the file -- if a key sits past the end, the block is appended again on
+   * every launch and the file grows without bound. 16 KB stopped being enough
+   * the moment the listing was added. */
+  static char text[128 * 1024];
   FILE *f = fopen(path, "r");
   if (!f) return;
   const size_t n = fread(text, 1, sizeof text - 1, f);
@@ -237,6 +647,157 @@ static int parse_bool(const char *key, const char *v, int *out) {
   return 0;
 }
 
+/* WHAT LIVES WHERE IN THE SAVE, established from a real Profile.Save:
+ *
+ *   inventory.towers  Dictionary<string, TowerMetaData>  -- the 18 CHARACTERS
+ *   inventory.items   List<Item>{name,uniqueId,isNew}    -- allies, weapons,
+ *                                                           trinkets
+ *
+ * Allies are NOT towers. A profile that had never seen the collection still
+ * listed BusinessMen and BoomerangMonkey under items, and both are allies. An
+ * earlier version of this file put all 82 characters AND allies into
+ * inventory.towers and the game crashed; that is why the split matters.
+ *
+ * Ids come from the Blooncyclopedia lists, converted to the save's naming
+ * (title-case words, punctuation dropped) and then CHECKED against the strings
+ * in the game's own bundles -- all 348 resolve. Six characters and three items
+ * differ from their display names:
+ *   Princess Bubblegum -> Bubblegum       Dungeon Finn -> WarriorFinn
+ *   Tuxedo Jake -> SerenadingJake         Warrior Bubblegum -> WarmasterBubblegum
+ *   Hunter Marceline -> MarcelineTheVampireHunter
+ *   Monkey Farmer -> BananaFarmer         COBRA -> Cobra
+ *   King of Ooo's Scepter -> KingOfOoosSceptre                              */
+static const char *ALL_TOWERS[] = {
+  "Finn", "Jake", "Max", "Bubblegum",
+  "IceKing", "CaptainCassie", "Marceline", "Sam",
+  "FlamePrincess", "C4Charlie", "Sai", "SuperMonkey",
+  "WarriorFinn", "SerenadingJake", "JuggernautMax", "WarmasterBubblegum",
+  "CommanderCassie", "MarcelineTheVampireHunter",
+};
+static const char *ALL_ITEMS[] = {
+  "Abracadaniel", "AncientPsychicTandemWarElephant", "BananaAirCorps",
+  "BananaGuards", "BananaMan", "BettyGrof",
+  "Billy", "Bmo", "BoomerangMonkey",
+  "BusinessMen", "CinnamonBun", "Clarence",
+  "Cobra", "DartMonkey", "DirtBeerGuy",
+  "DrMonkey", "ElfMonkey", "FlameKing",
+  "GhostPrincess", "GrassyWizard", "GrobGobGlobGrod",
+  "Gumbald", "Gunter", "HolidayBmo",
+  "HunsonAbadeer", "HuntressWizard", "IceMonkey",
+  "KingOfOoo", "LadyRainicorn", "LaserButterfly",
+  "Lemonhope", "LumpySpacePrincess", "Maja",
+  "MartianTransport", "Martin", "Minipults",
+  "Moe", "MonkeyApprentice", "BananaFarmer",
+  "MusclePrincess", "Neptr", "PartyGod",
+  "PeppermintButler", "PirateCrew", "Rattleballs",
+  "Ricardio", "Scorcher", "Shoko",
+  "SlimePrincess", "SniperMonkey", "SpaceLards",
+  "Squadron", "StarMan", "Starchy",
+  "SuperFans", "SusanStrong", "TechnologicalTerror",
+  "TinyManticore", "TrainBoss", "Treetrunks",
+  "VampireKing", "WaterNymph", "WildberryPrincess",
+  "WizardLord", "4DSword", "AbracadanielsWand",
+  "AcousticGuitar", "AxBass", "BallBlamBurglerber",
+  "Bananarangs", "Banjo", "BarbedDarts",
+  "BlessedDart", "Bloonsbane", "BomMo",
+  "BombChain", "Bomba", "BreadstickWand",
+  "ButterscotchBomb", "CandyBomb", "CandyCaneShotgun",
+  "CandyDuckAxe", "CandyHorseTranquilizer", "CandyMicrophone",
+  "CaptainTreeTrunksCutlass", "CarbBomb", "CherryBlossomWand",
+  "CherryBomb", "CryoBomb", "CyberneticArrow",
+  "DemonBloodSword", "DevilMonsterBass", "DrMonkeysSecretWeapon",
+  "DragonFangs", "DrillerDarts", "DynamiteStack",
+  "ElectrodeGun", "Excandybur", "ExplodingPineapples",
+  "FinnSword", "FinnsFlute", "FireGuitar",
+  "FireKingdomScepter", "FireSword", "FrozenThrowingKnives",
+  "Fumigator", "GarlicBomb", "GlobsSword",
+  "GoldenViola", "GrassSword", "GrassWand",
+  "GrenadeOfGlob", "GuntersTaser", "GwensFlamethrower",
+  "HonestyBells", "JakesSword", "JakesViola",
+  "JewelledCabasas", "JingleBomb", "LightningBolts",
+  "Liquifier", "LiquidPyrotechnicsLauncher", "LunaticBass",
+  "MartianBlaster", "MartianMic", "MilitaryDarts",
+  "Moap", "MouthOrgan", "MushroomBomb",
+  "NailGun", "NightSword", "Nothung",
+  "PenguinShell", "PeppermintBattleAxe", "PhoenixWand",
+  "PressureHose", "RainbowGlitterWand", "RazorBats",
+  "RepairedViola", "RevengeStick", "RodOfNiceness",
+  "RootSword", "SassageFlare", "Scarlet",
+  "SilverShurikens", "SilverTippedStakes", "SnakeDarts",
+  "SniperRifle", "SoulRedeemerSword", "SpiderWand",
+  "SplodeyDarts", "StickyShots", "TheLover",
+  "ThievesKatana", "ThoughtCannonWand", "Thundersword",
+  "TimeBomb", "UnimaginablyAmazingSword", "WandOfDispersement",
+  "WebGun", "WishyWand", "WizardLordWand",
+  "WizardThiefWand", "XergioksWand", "AbracadanielsHeadband",
+  "AbrahamLincolnsPenny", "AntiCamoDust", "AntiGravityToteChamber",
+  "Apple", "ApprenticeCap", "ArrowOfIce",
+  "BabyBlanket", "BabyTooth", "BagOfLollies",
+  "BakersShard", "BananaReplicator", "Basketball",
+  "BeANinja", "BeauteousWings", "BigRedButton",
+  "BlackBowTie", "BlazingFeet", "BloonTrap",
+  "BmosSkateboard", "BoobooSousa", "BottleRocket",
+  "BoxOfDirt", "BrainFood", "BranchesOfPalm",
+  "BubblegumsHair", "CandyDiveSuit", "CandySeeds",
+  "CandycornSpear", "CaptainTreeTrunksEyepatch", "CarlTheGem",
+  "CheesyDog", "ClaBlade", "Condiments",
+  "CosmicGauntlets", "Cryojet", "CrystalGemApple",
+  "CrystalMergenceOfDestruction", "CursedIceRing", "DaggerOfChilledGlass",
+  "DarkTempleIdol", "DaveyStache", "DeathsDrums",
+  "DemonHeart", "DemonicWishingEye", "DiveSuit",
+  "DoomGauntlets", "DragonEyes", "ElderPlopsScepter",
+  "ElementalStaff", "EnchantedBoomerang", "EngineersBlueprints",
+  "EyeFlail", "FinnsCrossbow", "FireCrown",
+  "FlowerCrown", "FreezingPotionA", "FutureCrystal",
+  "GauntletOfBones", "GauntletOfTheHero", "GemmaTheGemstone",
+  "GentleLasers", "GiantTranq", "GlaiveOfTheAncients",
+  "GlassesOfNerdicon", "GlobsHelmet", "Googoomamameter",
+  "GrapplingCrossbow", "GraveRing", "Hambo",
+  "HeartGauntlets", "HollyJollyScarf", "HollyJollySweater",
+  "HorseySoap", "IceBull", "IceCreamSundae",
+  "IceCrook", "IcebergBlade", "IronHull",
+  "IssueOfBle", "JamesLuckyCoin", "Jetpack",
+  "KingOfOoosSceptre", "KnifeStormCloud", "LambRelic",
+  "Lemonsweets", "LittleDude", "LumpinDeliciousSandwiches",
+  "LuteSuit", "MaceStake", "MagicCarpet",
+  "MagicCoinPurse", "MagicDoorPortal", "MagicMansHat",
+  "MagicPowder", "MagicSpanner", "MargaretsMusicBox",
+  "MartianTrackingDevice", "MaskOfShadows", "MedallionOfBrogends",
+  "MindGames", "Missile", "MonkeyAcademyDegree",
+  "MonkeyKingsRobe", "MortarHelmet", "MysteryCavePick",
+  "NightVisionXRayGoggles", "NinjaDagger", "NinjaHeadband",
+  "NumbChuks", "PaperPlateMask", "PeacockHat",
+  "PennysDagger", "PinkSweater", "PirateHat",
+  "PlasmaGoggles", "PocketWatch", "PowerRingOfChill",
+  "PowerRingOfDamage", "PowerRingOfPierce", "PowerRingOfPoison",
+  "PowerRingOfRange", "PowerRingOfSpeed", "PowerRingOfStrength",
+  "Powerometer", "PrincessPlant", "ProtectionGem",
+  "RCPlane", "Rainicornicopia", "RedBowTie",
+  "RedCowboyBoots", "RenceHilt", "RoboMonkeyVisor",
+  "RockShirt", "RoyalMedalForHeroicBravery", "SacredSpringScarf",
+  "ShardOfEverfrost", "SilverDagger", "SirenHat",
+  "SniperBeret", "SoftPretzels", "SoulStone",
+  "SpecialSentientSandwich", "SpoonOfProsperity", "StoneOfAncientKnowledge",
+  "StoneSkinPotion", "Strawberry", "StrikerJonesCap",
+  "SuperPorp", "Taser", "ThiefCrossbow",
+  "ThiefKingsDagger", "TigerClaw", "TikiShield",
+  "TimeTravelMachine", "TreasureChestKeys", "TreetrunksAppleKnife",
+  "TreetrunksDagger", "Trident", "UniversalCoin",
+  "VorpalHand", "WarningHorn", "WarpaintMud",
+  "WhistlingBook", "WindmillDagger", "WizardNunchuks",
+};
+#define N_ALL_ITEMS ((int)(sizeof ALL_ITEMS / sizeof *ALL_ITEMS))
+#define N_ALL_TOWERS ((int)(sizeof ALL_TOWERS / sizeof *ALL_TOWERS))
+
+/* towerMaxLevel is 10 in the game's own constants -- the old template here
+ * suggested "tower.Finn = 20", which is over the cap. */
+#define TOWER_LEVEL_MAX  10
+/* An arbitrary but deliberate ceiling on copies of one item. There is no
+ * quantity field: N copies means N more entries in inventory.items, so
+ * "max" has to mean something finite. 10 covers equipping the same trinket
+ * to every character at once and keeps the save a sane size. */
+#define ITEM_COPIES_MAX  10
+
 static int dyn_add(Dyn *tab, int *n, const char *name, const char *val,
                    const char *what, int as_bool) {
   if (*n >= N_DYN) { debugPrintf("[save] too many %s entries -- \"%s\" ignored\n", what, name); return 0; }
@@ -252,7 +813,9 @@ static int dyn_add(Dyn *tab, int *n, const char *name, const char *val,
 static int read_config(void) {
   char path[640], line[256];
   for (int i = 0; i < N_FIELDS; i++) { g_val[i] = -1; g_str[i][0] = 0; }
-  g_ntower = g_nadv = 0;
+  g_ntower = g_nadv = g_nunlock = 0;
+  g_unlock_all = g_unlock_items = -1;
+  g_item_count = 1; g_tower_level = -1;
   snprintf(path, sizeof path, "%s/save.txt", bp_game_root());
   FILE *f = fopen(path, "r");
   if (!f) { write_template(path); return 0; }
@@ -269,6 +832,55 @@ static int read_config(void) {
     trim(key); trim(val);
     if (!*key || !*val) continue;
 
+    if (!strcmp(key, "unlock_all_towers")) {
+      int b = -1;
+      if (parse_bool(key, val, &b)) { g_unlock_all = b; g_any |= (b > 0); }
+      continue;
+    }
+    if (!strcmp(key, "item_count")) {
+      long long v = -1;
+      if (parse_count(key, val, &v)) {
+        if (v < 1) v = 1;
+        if (v > ITEM_COPIES_MAX) {
+          debugPrintf("[save] item_count %lld is more than the %d this editor will add "
+                      "-- using %d\n", v, ITEM_COPIES_MAX, ITEM_COPIES_MAX);
+          v = ITEM_COPIES_MAX;
+        }
+        g_item_count = v; g_any = 1;
+      }
+      continue;
+    }
+    if (!strcmp(key, "tower_level")) {
+      long long v = -1;
+      if (parse_count(key, val, &v)) {
+        if (v > TOWER_LEVEL_MAX) {
+          debugPrintf("[save] tower_level %lld is above the game's cap of %d -- using %d\n",
+                      v, TOWER_LEVEL_MAX, TOWER_LEVEL_MAX);
+          v = TOWER_LEVEL_MAX;
+        }
+        if (v >= 1) { g_tower_level = v; g_any = 1; }
+      }
+      continue;
+    }
+    if (!strcmp(key, "max_everything")) {
+      int b = -1;
+      if (parse_bool(key, val, &b) && b > 0) {
+        g_unlock_all = g_unlock_items = 1;
+        g_item_count = ITEM_COPIES_MAX;
+        g_tower_level = TOWER_LEVEL_MAX;
+        g_any = 1;
+      }
+      continue;
+    }
+    if (!strcmp(key, "unlock_all_items")) {
+      int b = -1;
+      if (parse_bool(key, val, &b)) { g_unlock_items = b; g_any |= (b > 0); }
+      continue;
+    }
+    if (!strncmp(key, "unlock.", 7)) {
+      g_any |= dyn_add(g_unlock, &g_nunlock, key + 7, val, "unlock", 1);
+      continue;
+    }
     if (!strncmp(key, "tower.", 6)) {
       g_any |= dyn_add(g_tower, &g_ntower, key + 6, val, "tower", 0);
       continue;
@@ -502,12 +1114,191 @@ static void note(const char *fmt, const char *field, const char *from, const cha
   size_t l = strlen(g_changes);
   snprintf(g_changes + l, sizeof g_changes - l, fmt, l ? ", " : "", field, from, to);
 }
+/* REFUSE TO OVERWRITE A STRUCTURED VALUE.
+ *
+ * path_value() returns whatever span the key maps to, and for an object or an
+ * array that is the whole "{...}" / "[...]". Splicing a scalar over it produces
+ * JSON the game cannot deserialise back into the field's type.
+ *
+ * This is not hypothetical for the tower levels: ProfileModel.Inventory.
+ * TowerMetaData.level is a CryptVarInt32, whose fields are a byte[] val, two
+ * int key indices and a byte[] data. If Unity serialises that as an object,
+ * "tower.Finn = 20" would replace the object with 20 and break the save. The
+ * editor keeps a .orig copy, but a refusal that says so is better than a
+ * restore. If it turns out to be a plain integer, nothing here changes. */
+static int scalar_span(const char *j, size_t s, size_t e, const char *path) {
+  while (s < e && (j[s] == ' ' || j[s] == '\t' || j[s] == '\n' || j[s] == '\r')) s++;
+  if (s < e && (j[s] == '{' || j[s] == '[')) {
+    debugPrintf("[save] \"%s\" is %s in this save, not a plain value -- left alone "
+                "(editing it would corrupt the field)\n",
+                path, j[s] == '{' ? "an object" : "an array");
+    return 0;
+  }
+  return 1;
+}
+/* UNLOCK A TOWER: add a key to inventory.towers.
+ *
+ * This is the one place the editor INSERTS rather than replaces, so it is
+ * deliberately narrow. Ownership in this game is exactly "is there a key for
+ * it in inventory.towers" -- a real profile has five there, while seenTowers
+ * holds two names that are NOT owned, so seenTowers is a UI badge and not the
+ * gate. The value copies the shape the save already uses for an unequipped
+ * tower: {"level":1,"equippedItems":[]}.
+ *
+ * Refuses anything that is not a plain identifier, so a stray character in
+ * save.txt cannot inject JSON. Returns 1 if it added one. */
+static int tower_exists(const char *j, size_t n, const char *name) {
+  char p[128]; size_t s, e;
+  snprintf(p, sizeof p, "inventory.towers.%s", name);
+  return path_value(j, n, p, &s, &e);
+}
+static int unlock_tower(char **j, size_t *n, const char *name) {
+  for (const char *p = name; *p; p++)
+    if (!isalnum((unsigned char)*p) && *p != '_') {
+      debugPrintf("[save] \"%s\" is not a valid tower name -- skipped\n", name);
+      return 0;
+    }
+  if (!*name) return 0;
+  if (tower_exists(*j, *n, name)) return 0;                  /* already owned */
+  size_t s, e;
+  if (!path_value(*j, *n, "inventory.towers", &s, &e)) {
+    debugPrintf("[save] this save has no inventory.towers -- cannot unlock\n");
+    return 0;
+  }
+  if ((*j)[s] != '{') return 0;
+  /* after the '{': an empty object takes no comma, a populated one does */
+  size_t at = s + 1;
+  while (at < e && ((*j)[at]==' '||(*j)[at]=='\t'||(*j)[at]=='\n'||(*j)[at]=='\r')) at++;
+  const int empty = (at < e && (*j)[at] == '}');
+  char ins[160];
+  snprintf(ins, sizeof ins, "\"%s\":{\"level\":1,\"equippedItems\":[]}%s",
+           name, empty ? "" : ",");
+  if (!splice(j, n, s + 1, s + 1, ins)) return 0;
+  return 1;
+}
+/* UNLOCK AN ITEM: append to inventory.items.
+ *
+ * Different shape from a tower. items is a LIST of
+ * {"name":...,"uniqueId":N,"isNew":true} and every entry needs an id no other
+ * entry uses; itemUniqueIdSupplier holds the next one. So: read the supplier,
+ * append entries counting up from it, write the supplier back. Names are added
+ * to seenItems too, otherwise the whole collection screen is a wall of "new"
+ * badges.
+ *
+ * Skips anything already present, so running twice adds nothing and an item
+ * the player earned keeps its original id. */
+static int item_present(const char *j, size_t n, const char *name) {
+  /* "name":"<name>" inside the items array; a plain search is enough because
+   * ids are alphanumeric and cannot appear as a substring of a longer id
+   * without the closing quote differing. */
+  char pat[96];
+  snprintf(pat, sizeof pat, "\"name\":\"%s\"", name);
+  const size_t pl = strlen(pat);
+  for (size_t i = 0; i + pl <= n; i++) if (!memcmp(j + i, pat, pl)) return 1;
+  /* the encoder may emit a space after the colon */
+  snprintf(pat, sizeof pat, "\"name\": \"%s\"", name);
+  const size_t pl2 = strlen(pat);
+  for (size_t i = 0; i + pl2 <= n; i++) if (!memcmp(j + i, pat, pl2)) return 1;
+  return 0;
+}
+static int valid_id(const char *s) {
+  if (!*s) return 0;
+  for (const char *p = s; *p; p++) if (!isalnum((unsigned char)*p) && *p != '_') return 0;
+  return 1;
+}
+/* copies: how many of each. The save has no quantity field -- an item you own
+ * twice is simply two entries with the same name and different uniqueIds, which
+ * is how the game lets you equip the same trinket to two characters. So N
+ * copies means N entries. Existing copies are counted, and only the shortfall
+ * is added, so raising item_count from 2 to 5 tops up rather than duplicating. */
+static int item_count_in(const char *j, size_t n, const char *name) {
+  char pat[96], pat2[96];
+  snprintf(pat,  sizeof pat,  "\"name\":\"%s\"",  name);
+  snprintf(pat2, sizeof pat2, "\"name\": \"%s\"", name);
+  const size_t a = strlen(pat), b = strlen(pat2);
+  int c = 0;
+  for (size_t i = 0; i + a <= n; i++) if (!memcmp(j + i, pat, a)) c++;
+  for (size_t i = 0; i + b <= n; i++) if (!memcmp(j + i, pat2, b)) c++;
+  return c;
+}
+static int unlock_items(char **j, size_t *n, const char *const *names, int count, int copies) {
+  size_t s, e;
+  if (!path_value(*j, *n, "inventory.itemUniqueIdSupplier", &s, &e)) {
+    debugPrintf("[save] no inventory.itemUniqueIdSupplier -- cannot add items\n");
+    return 0;
+  }
+  char num[32];
+  snprintf(num, sizeof num, "%.*s", (int)(e - s) < 31 ? (int)(e - s) : 31, *j + s);
+  long long next = atoll(num);
+  if (next <= 0) next = 1;
+
+  int added = 0;
+  for (int k = 0; k < count; k++) {
+    const char *nm = names[k];
+    if (!valid_id(nm)) { debugPrintf("[save] \"%s\" is not a valid item name -- skipped\n", nm); continue; }
+    int want = copies - item_count_in(*j, *n, nm);
+    for (; want > 0; want--) {
+    size_t as, ae;
+    if (!path_value(*j, *n, "inventory.items", &as, &ae) || (*j)[as] != '[') { k = count; break; }
+    size_t at = as + 1;
+    while (at < ae && ((*j)[at]==' '||(*j)[at]=='\t'||(*j)[at]=='\n'||(*j)[at]=='\r')) at++;
+    const int empty = (at < ae && (*j)[at] == ']');
+    char ins[192];
+    snprintf(ins, sizeof ins, "{\"name\":\"%s\",\"uniqueId\":%lld,\"isNew\":false}%s",
+             nm, next, empty ? "" : ",");
+    if (!splice(j, n, as + 1, as + 1, ins)) { k = count; break; }
+    /* and mark it seen, so the collection is not all "new" */
+    if (path_value(*j, *n, "inventory.seenItems", &as, &ae) && (*j)[as] == '[') {
+      at = as + 1;
+      while (at < ae && ((*j)[at]==' '||(*j)[at]=='\t'||(*j)[at]=='\n'||(*j)[at]=='\r')) at++;
+      const int sempty = (at < ae && (*j)[at] == ']');
+      char sins[96];
+      snprintf(sins, sizeof sins, "\"%s\"%s", nm, sempty ? "" : ",");
+      splice(j, n, as + 1, as + 1, sins);
+    }
+    next++; added++;
+    }
+  }
+  if (added) {
+    /* write the supplier back, from scratch: the spans above have moved */
+    if (path_value(*j, *n, "inventory.itemUniqueIdSupplier", &s, &e)) {
+      char rep[32];
+      snprintf(rep, sizeof rep, "%lld", next);
+      splice(j, n, s, e, rep);
+    }
+  }
+  return added;
+}
+/* ROUTE A NAME TO THE RIGHT HALF OF THE SAVE.
+ *
+ * unlock.<Name> used to call unlock_tower() whatever the name was, so
+ * "unlock.Abracadaniel = true" would have put an ALLY into inventory.towers --
+ * precisely the mistake that crashed the game when the whole list went in
+ * there. A name is a character or an item or neither, and the tables say
+ * which; anything not in either is refused rather than guessed at. */
+static int in_table(const char *const *tab, int n, const char *name) {
+  for (int i = 0; i < n; i++) if (!strcmp(tab[i], name)) return 1;
+  return 0;
+}
+static int unlock_named(char **j, size_t *n, const char *name, int *towers, int *items) {
+  if (in_table(ALL_TOWERS, N_ALL_TOWERS, name)) { *towers += unlock_tower(j, n, name); return 1; }
+  if (in_table(ALL_ITEMS,  N_ALL_ITEMS,  name)) {
+    const char *one[1] = { name };
+    *items += unlock_items(j, n, one, 1, (int)g_item_count);
+    return 1;
+  }
+  debugPrintf("[save] \"%s\" is not a character or an item in this game -- skipped. "
+              "See the lists in save.txt; names are the internal ids, not the "
+              "display names (Princess Bubblegum is \"Bubblegum\").\n", name);
+  return 0;
+}
 static void set_int(char **j, size_t *n, const char *path, long long v) {
   size_t s, e;
   if (v < 0) return;
   if (!path_value(*j, *n, path, &s, &e)) {
     debugPrintf("[save] the save has no \"%s\" -- left alone\n", path); return;
   }
+  if (!scalar_span(*j, s, e, path)) return;
   char old[48], rep[32];
   snprintf(old, sizeof old, "%.*s", (int)(e - s), *j + s);
   snprintf(rep, sizeof rep, "%lld", v);
@@ -519,6 +1310,7 @@ static void set_bool(char **j, size_t *n, const char *path, int v) {
   if (!path_value(*j, *n, path, &s, &e)) {
     debugPrintf("[save] the save has no \"%s\" -- left alone\n", path); return;
   }
+  if (!scalar_span(*j, s, e, path)) return;
   char old[16];
   snprintf(old, sizeof old, "%.*s", (int)(e - s), *j + s);
   const char *rep = v ? "true" : "false";
@@ -537,6 +1329,7 @@ static void set_str(char **j, size_t *n, const char *path, const char *v) {
   if (!path_value(*j, *n, path, &s, &e)) {
     debugPrintf("[save] the save has no \"%s\" -- left alone\n", path); return;
   }
+  if (!scalar_span(*j, s, e, path)) return;
   char old[80], rep[80];
   snprintf(old, sizeof old, "%.*s", (int)(e - s), *j + s);
   snprintf(rep, sizeof rep, "\"%s\"", v);
@@ -580,6 +1373,32 @@ static void patch_save(const char *path) {
       case F_STR:  set_str(&json, &jl, FIELDS[i].path, g_str[i]);        break;
     }
   }
+  /* Unlocks first, so a tower.<Name> level below can apply to one that was
+   * just added. */
+  int added = 0, items_added = 0;
+  if (g_unlock_all > 0)
+    for (int i = 0; i < N_ALL_TOWERS; i++) added += unlock_tower(&json, &jl, ALL_TOWERS[i]);
+  if (g_unlock_items > 0)
+    items_added += unlock_items(&json, &jl, ALL_ITEMS, N_ALL_ITEMS, (int)g_item_count);
+  for (int i = 0; i < g_nunlock; i++)
+    if (g_unlock[i].v > 0) unlock_named(&json, &jl, g_unlock[i].name, &added, &items_added);
+  if (added || items_added) {
+    static char c[48];
+    snprintf(c, sizeof c, "%d towers, %d items", added, items_added);
+    note("%s%s %s->%s", "unlocked", "0", c);
+  }
+
+  /* tower_level applies to every character the save holds, after the unlocks,
+   * so it covers ones added a moment ago. An explicit tower.<Name> below still
+   * wins, because it is applied after this. */
+  if (g_tower_level >= 1)
+    for (int i = 0; i < N_ALL_TOWERS; i++) {
+      char p[128];
+      snprintf(p, sizeof p, "inventory.towers.%s.level", ALL_TOWERS[i]);
+      size_t ls, le;
+      if (path_value(json, jl, p, &ls, &le)) set_int(&json, &jl, p, g_tower_level);
+    }
+
   for (int i = 0; i < g_ntower; i++) {
     char p[128];
     snprintf(p, sizeof p, "inventory.towers.%s.level", g_tower[i].name);

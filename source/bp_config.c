@@ -26,9 +26,9 @@ int   bp_mt_sample    = 0;   /* [mt] sampler: off unless config.txt asks */
 int   bp_ram_delay_ms = 0;   /* timing experiment, see config.h */
 int   bp_ram_skip_tail = 0;  /* see config.h */
 int   bp_diag_io = 0;        /* see config.h */
-int   bp_mmap_arena_mb = 1280;
-int   bp_gpu_arena_mb  = 448;   /* measured peak 340; not configurable */
-int   bp_ram_max_file_mb = 80;
+int   bp_mmap_arena_mb = 1408;  /* peak varies 1161-1212 per boot; see config.h */
+int   bp_gpu_arena_mb  = 430;   /* peak 340 over a 30k-frame session; see config.h */
+int   bp_ram_max_file_mb = 16;
 extern int bp_cache_lock_mode;   /* libc_shim.c: 0 never, 1 offline-only, 2 always */
 int   bp_allow_online = 0;   /* config.txt online; false = go offline once cached */
 int   bp_art_quality = 2;     /* config.txt art_quality; -1 = auto (no patch) */
